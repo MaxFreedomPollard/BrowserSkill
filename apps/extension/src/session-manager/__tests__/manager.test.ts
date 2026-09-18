@@ -107,7 +107,7 @@ describe("SessionManager", () => {
     expect(sm.has("aa11")).toBe(false);
   });
 
-  it("surfaces the orphan Agent Window id when startup cleanup fails", async () => {
+  it("retains a failed startup window so stop can retry cleanup", async () => {
     const aw = fakeAgentWindow();
     aw.ensureActiveTabMock.mockRejectedValueOnce(new Error("tab setup failed"));
     aw.removeMock.mockRejectedValueOnce(new Error("window removal denied"));
@@ -118,7 +118,12 @@ describe("SessionManager", () => {
       windowId: 100,
       message: expect.stringMatching(/cleanup of Agent Window 100 failed.*window removal denied/),
     });
+    expect(sm.has("aa11")).toBe(true);
+    expect(sm.findByWindowId(100)?.sessionId).toBe("aa11");
+    await sm.stop("aa11");
+    expect(aw.removeMock).toHaveBeenCalledTimes(2);
     expect(sm.has("aa11")).toBe(false);
+    expect(sm.findByWindowId(100)).toBeNull();
   });
 
   it("stop() closes the Agent Window and forgets the session", async () => {

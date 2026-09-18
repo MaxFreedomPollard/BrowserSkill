@@ -321,6 +321,7 @@ export class ObservationService {
    */
   async stopSession(sessionId: string, signal?: AbortSignal): Promise<boolean> {
     if (!this.deps.registry.isOwned(sessionId)) return false;
+    const requestId = this.deps.registry.requestFor(sessionId);
     const releaseForeground = this.acquireForeground(sessionId);
     let actionError: string | undefined;
     this.beginAction(sessionId, "stopping");
@@ -331,18 +332,28 @@ export class ObservationService {
         () =>
           runWithSessionBusyRetry(
             () =>
-              this.deps.runner.run(["session", "stop", sessionId], {
-                signal,
-                timeoutMs: 30_000,
-                tag: sessionId,
-              }),
+              this.deps.runner.run(
+                requestId
+                  ? ["session", "request", requestId, "--cancel"]
+                  : ["session", "stop", sessionId],
+                {
+                  signal,
+                  timeoutMs: 30_000,
+                  tag: sessionId,
+                },
+              ),
             signal,
           ),
         signal,
       );
       if (result.aborted) throw abortError();
       try {
-        parseBskJson(result, "session stop");
+        const reply = parseBskJson(result, "session stop") as {
+          state?: string;
+          cleanup_error?: string;
+        };
+        if (requestId && reply.state !== "closed" && reply.state !== "failed")
+          throw new Error(reply.cleanup_error ?? "Browser cleanup is still pending; retry stop.");
       } catch (error) {
         if (!isSessionNotFoundError(error)) throw error;
       }

@@ -15,6 +15,8 @@
 
 export interface TrackedSession {
   sessionId: string;
+  /** Stable lifecycle handle, retained even if the short session ID is reused. */
+  requestId?: string;
   browserInstanceId?: string;
   startedAtMs: number;
   /** Always true: only plugin-created sessions enter the registry at all. */
@@ -44,8 +46,8 @@ export class SessionRegistry {
    * Reserve a start slot synchronously, BEFORE spawning.
    * @throws when the configured concurrency cap (tracked + in-flight) is reached.
    */
-  reserveStart(): void {
-    if (this.sessions.size + this.pendingStarts >= this.maxSessions) {
+  reserveStart(recoveredPending = 0): void {
+    if (this.sessions.size + this.pendingStarts + recoveredPending >= this.maxSessions) {
       throw new Error(
         `session limit reached (${this.maxSessions} concurrent sessions); ` +
           "stop one with browser_session action=stop before starting another",
@@ -139,6 +141,10 @@ export class SessionRegistry {
   /** Whether the session was created by this plugin. */
   isOwned(sessionId: string): boolean {
     return this.sessions.get(sessionId)?.owned === true;
+  }
+
+  requestFor(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.requestId;
   }
 
   size(): number {

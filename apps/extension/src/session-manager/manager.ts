@@ -253,6 +253,19 @@ export class SessionManager {
         try {
           await this.agentWindow.remove(windowId);
         } catch (cleanupError) {
+          // The daemon may retry stop after a failed startup rollback. Retain
+          // the exact window handle until closure is confirmed.
+          const pending: SessionContext = {
+            ...(this.remote() ? { remote: true } : {}),
+            sessionId,
+            agentWindowId: windowId,
+            refStore: new RefStore(),
+            borrowedTabs: new Map(),
+            agentCreatedTabs: new Set(),
+            createdAtMs: this.now(),
+          };
+          this.sessions.set(sessionId, pending);
+          this.windowIndex.set(windowId, sessionId);
           throw new SessionStartCleanupError(windowId, startupError, cleanupError);
         }
       }
