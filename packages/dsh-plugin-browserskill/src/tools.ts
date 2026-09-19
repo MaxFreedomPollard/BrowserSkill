@@ -87,6 +87,7 @@ async function runBsk(
   label: string,
   observeSession?: string,
   runnerTimeoutMs?: number,
+  initializing = false,
 ): Promise<unknown> {
   const releaseForeground =
     observeSession !== undefined ? deps.observation.acquireForeground(observeSession) : undefined;
@@ -103,15 +104,19 @@ async function runBsk(
           began = true;
           deps.observation.beginAction(observeSession, actionForLabel(label));
         }
-        return runWithSessionBusyRetry(
-          () =>
-            deps.runner.run(args, {
-              signal: exec.signal,
-              timeoutMs: runnerTimeoutMs ?? deps.config.defaultTimeoutMs,
-              ...(observeSession !== undefined ? { tag: observeSession } : {}),
-            }),
-          exec.signal,
-        );
+        return runWithSessionBusyRetry(async () => {
+          if (
+            observeSession !== undefined &&
+            !(initializing && deps.registry.stateFor(observeSession) === "starting")
+          ) {
+            deps.registry.assertUsable(observeSession, label);
+          }
+          return deps.runner.run(args, {
+            signal: exec.signal,
+            timeoutMs: runnerTimeoutMs ?? deps.config.defaultTimeoutMs,
+            ...(observeSession !== undefined ? { tag: observeSession } : {}),
+          });
+        }, exec.signal);
       };
       result =
         observeSession !== undefined
@@ -259,6 +264,8 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
               ["emulate", "--session", reply.session_id, "--device", args.device],
               "emulate",
               reply.session_id,
+              undefined,
+              true,
             );
           }
           if (args.url !== undefined) {
@@ -268,6 +275,8 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
               ["navigate", "--session", reply.session_id, args.url],
               "navigate",
               reply.session_id,
+              undefined,
+              true,
             );
           }
           await starts.claim(record, exec.signal);
@@ -371,6 +380,11 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
                   sessionId: { type: "string", required: true },
                   browserInstanceId: { type: "string", required: true },
                   current: { type: "boolean", required: true },
+                  state: {
+                    type: "string",
+                    enum: ["starting", "active", "cleanup"],
+                    required: true,
+                  },
                 },
               },
             },
@@ -387,7 +401,7 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
                 : value.sessions
                     .map(
                       (s) =>
-                        `${s.sessionId} (browser ${s.browserInstanceId})${s.current ? " [current]" : ""}`,
+                        `${s.sessionId} (browser ${s.browserInstanceId})${s.current ? " [current]" : ""}${s.state !== "active" ? ` [${s.state}]` : ""}`,
                     )
                     .join("\n"),
           },
@@ -404,6 +418,7 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
             sessionId: entry.sessionId,
             browserInstanceId: entry.browserInstanceId ?? "",
             current: entry.sessionId === current,
+            state: entry.state,
           })),
         };
       },

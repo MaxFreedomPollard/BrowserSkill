@@ -101,11 +101,14 @@ export class SessionStarts {
       throw new Error("browser session id conflicts with another owned start");
     }
     if (!this.reserved.has(record.requestId)) this.deps.registry.reserveStart();
-    this.deps.registry.completeStart({
-      ...record.session,
-      requestId: record.requestId,
-      startedAtMs: record.startedAtMs,
-    });
+    this.deps.registry.trackStart(
+      {
+        ...record.session,
+        requestId: record.requestId,
+        startedAtMs: record.startedAtMs,
+      },
+      record.cleanup ? "cleanup" : "starting",
+    );
     this.reserved.delete(record.requestId);
     this.deps.registry.trackOwner(record.session.sessionId, record.owners);
     this.deps.observation.addSession(record.session.sessionId);
@@ -113,6 +116,8 @@ export class SessionStarts {
 
   async claim(record: StartRecord, signal: AbortSignal): Promise<void> {
     this.assertStarting(record);
+    if (!record.session || !this.ownsRegisteredSession(record))
+      throw new Error("browser start must be registered before claiming it");
     const result = await this.deps.runner.run(["session", "request", record.requestId, "--claim"], {
       timeoutMs: 30_000,
       signal,
@@ -121,11 +126,17 @@ export class SessionStarts {
     const status = parseBskJson(result, "session request") as RequestStatus;
     if (status.state !== "active") throw new Error("browser start could not be claimed");
     this.assertStarting(record);
+    this.deps.registry.activate(record.session.sessionId);
+    this.deps.observation.endAction(record.session.sessionId);
   }
 
   async fail(record: StartRecord): Promise<void> {
     if (!this.journal.records.has(record.requestId)) return;
     record.cleanup = true;
+    if (record.session && this.ownsRegisteredSession(record)) {
+      this.deps.registry.markForCleanup(record.session.sessionId);
+      this.deps.observation.endAction(record.session.sessionId);
+    }
     // Keep the original record in memory even if persistence fails. Its
     // write-ahead version still lets a subsequent host clean up by request ID.
     try {

@@ -70,7 +70,7 @@ function harness(
     runner,
     registry,
     queue,
-    options: { enabled: false, thumbnailIntervalMs: 1500, idleIntervalMs: 8000 },
+    options: { enabled: true, thumbnailIntervalMs: 1500, idleIntervalMs: 8000 },
   });
   const deps: ToolDeps = {
     ctx: ctx as never,
@@ -82,7 +82,7 @@ function harness(
       bskPath: "bsk",
       defaultTimeoutMs: 120000,
       maxSessions: 5,
-      observationEnabled: false,
+      observationEnabled: true,
       thumbnailIntervalMs: 1500,
       idleIntervalMs: 8000,
       lazyTools: false,
@@ -96,10 +96,196 @@ function harness(
     await starts.dispose();
     observation.dispose();
   });
-  return { starts, registry, journal, calls, session, runner, prepare };
+  return { starts, registry, journal, calls, session, runner, prepare, tools, observation, queue };
 }
 
 describe("recoverable plugin starts", () => {
+  it("publishes a session only after both initialization and claim succeed", async () => {
+    let finishNavigation!: (result: BskRunResult) => void;
+    let finishClaim!: (result: BskRunResult) => void;
+    const h = harness(async (args) => {
+      if (args[1] === "start")
+        return ok({ session_id: "starting", browser_instance_id: "browser" });
+      if (args[0] === "navigate")
+        return new Promise((resolve) => {
+          finishNavigation = resolve;
+        });
+      if (args.includes("--claim"))
+        return new Promise((resolve) => {
+          finishClaim = resolve;
+        });
+      return ok({ state: "closed" });
+    });
+    h.registry.completeStart({ sessionId: "working", startedAtMs: 1 });
+    const starting = h.session({
+      action: "start",
+      device: "iphone-14",
+      url: "https://example.com",
+    });
+    await vi.waitFor(() => expect(finishNavigation).toBeTypeOf("function"));
+    const assertUnavailable = async () => {
+      expect(h.registry.current()).toBe("working");
+      expect(h.registry.size()).toBe(2);
+      expect(await h.session({ action: "list" })).toMatchObject({
+        sessions: [
+          { sessionId: "working", state: "active", current: true },
+          { sessionId: "starting", state: "starting", current: false },
+        ],
+      });
+      const before = h.calls.length;
+      await expect(
+        h.tools.get("browser_page")!.execute(
+          {
+            action: "navigate",
+            session: "starting",
+            url: "https://example.org",
+          },
+          exec(),
+        ),
+      ).rejects.toThrow(/not ready/);
+      expect(h.calls).toHaveLength(before);
+    };
+    await assertUnavailable();
+    finishNavigation(ok({ url: "https://example.com", reached: "load", tab_id: 1 }));
+    await vi.waitFor(() => expect(finishClaim).toBeTypeOf("function"));
+    await assertUnavailable();
+    finishClaim(ok({ state: "active" }));
+    await expect(starting).resolves.toMatchObject({ sessionId: "starting" });
+    expect(h.registry.current()).toBe("starting");
+    expect(h.registry.resolve("starting", "tool")).toBe("starting");
+    expect(h.observation.getState()).toContainEqual(
+      expect.objectContaining({
+        sessionId: "starting",
+        action: "idle",
+      }),
+    );
+  });
+
+  it("refuses a late claim after a stop fails during initialization", async () => {
+    let finishClaim!: (result: BskRunResult) => void;
+    const h = harness(async (args) => {
+      if (args[1] === "start")
+        return ok({ session_id: "starting", browser_instance_id: "browser" });
+      if (args.includes("--claim"))
+        return new Promise((resolve) => {
+          finishClaim = resolve;
+        });
+      return failed("close unavailable");
+    });
+    const starting = h.session({ action: "start" });
+    const rejected = expect(starting).rejects.toThrow(/cancelled|activation/);
+    await vi.waitFor(() => expect(finishClaim).toBeTypeOf("function"));
+    await expect(h.session({ action: "stop", session: "starting" })).rejects.toThrow(
+      /close unavailable/,
+    );
+    finishClaim(ok({ state: "active" }));
+    await rejected;
+    expect(h.registry.current()).toBeUndefined();
+    expect(h.registry.isOwned("starting")).toBe(true);
+    expect(h.registry.stateFor("starting")).toBe("cleanup");
+    expect(h.starts.pendingCleanup()).toBe(1);
+  });
+
+  it("rejects already queued ordinary work when its session enters cleanup", async () => {
+    const h = harness(async (args) => {
+      if (args[1] === "start") return ok({ session_id: "created", browser_instance_id: "browser" });
+      if (args.includes("--claim")) return ok({ state: "active" });
+      return failed("close unavailable");
+    });
+    await h.session({ action: "start" });
+    let release!: () => void;
+    const blocker = h.queue.run(
+      "created",
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const queued = h.tools.get("browser_page")!.execute(
+      {
+        action: "navigate",
+        session: "created",
+        url: "https://example.com",
+      },
+      exec(),
+    );
+    const rejected = expect(queued).rejects.toThrow(/awaiting cleanup/);
+    h.starts.archive("conversation");
+    expect(h.registry.current()).toBeUndefined();
+    release();
+    await blocker;
+    await rejected;
+    expect(h.calls.some(({ args }) => args[0] === "navigate")).toBe(false);
+    expect(h.registry.isOwned("created")).toBe(true);
+  });
+
+  it("adopts recovered cleanup resources without making them usable", async () => {
+    const journal = memoryStartJournal();
+    journal.records.set("recovered", {
+      requestId: "recovered",
+      startedAtMs: 1,
+      owners: [],
+      cleanup: true,
+    });
+    const h = harness(
+      async () =>
+        ok({
+          state: "cleanup_failed",
+          session: { session_id: "broken", browser_instance_id: "browser" },
+          cleanup_error: "close unavailable",
+        }),
+      journal,
+    );
+    h.registry.completeStart({ sessionId: "working", startedAtMs: 1 });
+    await h.starts.reconcile();
+    expect(h.registry.current()).toBe("working");
+    expect(h.registry.stateFor("broken")).toBe("cleanup");
+    expect(h.registry.resolveForStop("broken")).toBe("broken");
+    expect(() => h.registry.resolve("broken", "tool")).toThrow(/awaiting cleanup/);
+    expect(h.registry.size()).toBe(2);
+    h.registry.remove("working");
+    expect(h.registry.current()).toBeUndefined();
+    expect(() => h.registry.resolve(undefined, "tool")).toThrow(/none is active/);
+    expect(h.registry.resolveForStop(undefined)).toBe("broken");
+  });
+
+  it("keeps the working session current when another start and its cleanup fail", async () => {
+    let count = 0;
+    let canClose = false;
+    const h = harness(async (args) => {
+      if (args[1] === "start")
+        return ok({
+          session_id: count++ === 0 ? "working" : "broken",
+          browser_instance_id: "browser",
+        });
+      if (args.includes("--claim")) return ok({ state: "active" });
+      if (args.includes("--cancel"))
+        return canClose ? ok({ state: "closed" }) : failed("close unavailable");
+      if (args[0] === "navigate" && args.includes("broken")) return failed("navigation failed");
+      return ok({ url: "https://example.com", reached: "load", tab_id: 1 });
+    });
+    await h.session({ action: "start" });
+    await expect(h.session({ action: "start", url: "https://example.com" })).rejects.toThrow(
+      /navigation failed/,
+    );
+    expect(h.registry.current()).toBe("working");
+    expect(h.registry.ownedIds()).toEqual(["working", "broken"]);
+    expect(h.registry.size()).toBe(2);
+    expect(h.starts.pendingCleanup()).toBe(1);
+    const page = h.tools.get("browser_page")!;
+    await page.execute({ action: "navigate", url: "https://example.com" }, exec());
+    expect(h.calls.at(-1)?.args).toContain("working");
+    const before = h.calls.length;
+    await expect(
+      page.execute({ action: "navigate", url: "https://example.com", session: "broken" }, exec()),
+    ).rejects.toThrow(/cleanup|not ready/);
+    expect(h.calls).toHaveLength(before);
+    canClose = true;
+    await h.session({ action: "stop", session: "broken" });
+    expect(h.registry.current()).toBe("working");
+    expect(h.registry.ownedIds()).toEqual(["working"]);
+  });
   it.each([
     "lost reply",
     "aborted success",
@@ -155,7 +341,7 @@ describe("recoverable plugin starts", () => {
     expect(h.starts.pendingCleanup()).toBe(1);
     expect(await h.session({ action: "list" })).toMatchObject({
       pendingCleanup: 1,
-      sessions: [{ sessionId: "created" }],
+      sessions: [{ sessionId: "created", state: "cleanup", current: false }],
     });
     canClose = true;
     await h.session({ action: "list" });

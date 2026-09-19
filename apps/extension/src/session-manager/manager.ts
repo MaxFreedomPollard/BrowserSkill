@@ -226,11 +226,19 @@ export class SessionManager {
     throwIfSessionStartAborted(opts.signal);
 
     let windowId: number | null = null;
+    const agentCreatedTabs = new Set<number>();
     try {
       const { signal: _signal, ...createOptions } = opts;
-      windowId = await this.agentWindow.create(AGENT_WINDOW_HOME, createOptions);
+      const created = await this.agentWindow.create(AGENT_WINDOW_HOME, createOptions);
+      windowId = created.windowId;
+      for (const tabId of created.initialTabIds) agentCreatedTabs.add(tabId);
       throwIfSessionStartAborted(opts.signal);
-      const homeTabId = await this.agentWindow.ensureActiveTab(windowId, AGENT_WINDOW_HOME);
+      const homeTabId = await this.agentWindow.ensureActiveTab(
+        windowId,
+        AGENT_WINDOW_HOME,
+        agentCreatedTabs,
+      );
+      agentCreatedTabs.add(homeTabId);
       throwIfSessionStartAborted(opts.signal);
 
       const ctx: SessionContext = {
@@ -239,10 +247,10 @@ export class SessionManager {
         agentWindowId: windowId,
         refStore: new RefStore(),
         borrowedTabs: new Map(),
-        // The home tab is the session's first explicit claim. Every other
-        // tab remains free until `tab_create` or `tab_borrow` identifies it
-        // by its concrete Chrome tab id.
-        agentCreatedTabs: new Set([homeTabId]),
+        // Capture ownership at creation, before initialization can fail.
+        // Later tabs remain free until `tab_create` or `tab_borrow` identifies
+        // them by their concrete Chrome tab id.
+        agentCreatedTabs,
         createdAtMs: this.now(),
       };
       this.sessions.set(sessionId, ctx);
@@ -261,7 +269,7 @@ export class SessionManager {
             agentWindowId: windowId,
             refStore: new RefStore(),
             borrowedTabs: new Map(),
-            agentCreatedTabs: new Set(),
+            agentCreatedTabs,
             createdAtMs: this.now(),
           };
           this.sessions.set(sessionId, pending);
