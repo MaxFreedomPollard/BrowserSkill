@@ -310,46 +310,58 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
       name: "session.stop",
       description:
         "Stop a browser session and close its Agent Window. Stops the given session, or the " +
-        "current session when `session` is omitted. Only plugin-created sessions " +
-        "can be stopped — sessions owned by other programs sharing the bsk daemon are refused.",
-      parameters: { session: SESSION_PARAM },
+        "current session when `session` is omitted. An unacknowledged stop is retried before " +
+        "selecting another session; specify session or requestId if several stops are pending. " +
+        "A requestId identifies the original start even if its short session ID is reused. Once accepted, " +
+        "cleanup continues if this call is aborted. Only plugin-created sessions can be stopped.",
+      parameters: {
+        session: SESSION_PARAM,
+        requestId: {
+          type: "string",
+          description:
+            "Owned lifecycle request ID to stop or acknowledge; mutually exclusive with session.",
+        },
+      },
       output: {
         schema: {
           type: "object",
           additionalProperties: false,
-          properties: { stopped: { type: "string", required: true } },
+          properties: {
+            stopped: { type: "string", required: true },
+            requestId: { type: "string", required: true },
+            alreadyClosed: { type: "boolean", required: true },
+          },
         },
         render: (_args, value) => [
-          { type: "text", text: `stopped browser session ${value.stopped}` },
+          {
+            type: "text",
+            text: `${value.alreadyClosed ? "previous stop completed for" : "stopped browser session"} ${value.stopped} (request ${value.requestId})`,
+          },
         ],
       },
       async execute(args, exec) {
-        if (
-          args.session === undefined &&
-          registry.current() === undefined &&
-          deps.starts?.pendingCleanup()
-        ) {
-          await deps.starts.reconcile();
-          if (deps.starts.pendingCleanup())
-            throw new Error("Browser start cleanup is still pending; retry stop.");
-          return { stopped: "pending browser starts" };
-        }
-        const sessionId = registry.resolveForStop(args.session);
         try {
-          const stopped = await deps.observation.stopSession(sessionId, exec.signal);
-          if (!stopped) throw new Error(`browser session ${sessionId} is not owned by this plugin`);
+          const starts = (deps.starts ??= new SessionStarts(deps));
+          return await starts.stop({
+            sessionId: args.session,
+            requestId: args.requestId,
+            signal: exec.signal,
+          });
         } catch (error) {
           if (isCommandNotFound(error)) {
             throw new Error(bskInstallMessage(deps.config.bskPath));
           }
           throw error;
         }
-        deps.starts?.forgetStopped();
-        return { stopped: sessionId };
       },
       presentCall: (args) => ({
         card: "terminal",
-        title: cmdline(deps, ["session", "stop", args.session ?? "(current session)"]),
+        title: cmdline(
+          deps,
+          args.requestId
+            ? ["session", "request", args.requestId, "--cancel"]
+            : ["session", "stop", args.session ?? "(current or pending stop)"],
+        ),
         description: "Stop a browser session",
       }),
       presentResult: presentTerminalResult,
@@ -379,6 +391,7 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
                 properties: {
                   sessionId: { type: "string", required: true },
                   browserInstanceId: { type: "string", required: true },
+                  requestId: { type: "string" },
                   current: { type: "boolean", required: true },
                   state: {
                     type: "string",
@@ -401,7 +414,7 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
                 : value.sessions
                     .map(
                       (s) =>
-                        `${s.sessionId} (browser ${s.browserInstanceId})${s.current ? " [current]" : ""}${s.state !== "active" ? ` [${s.state}]` : ""}`,
+                        `${s.sessionId} (browser ${s.browserInstanceId})${s.current ? " [current]" : ""}${s.state !== "active" ? ` [${s.state}]` : ""}${s.requestId ? ` (request ${s.requestId})` : ""}`,
                     )
                     .join("\n"),
           },
@@ -417,6 +430,7 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
           sessions: registry.list().map((entry) => ({
             sessionId: entry.sessionId,
             browserInstanceId: entry.browserInstanceId ?? "",
+            ...(entry.requestId ? { requestId: entry.requestId } : {}),
             current: entry.sessionId === current,
             state: entry.state,
           })),

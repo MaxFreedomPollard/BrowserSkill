@@ -20,6 +20,10 @@ export interface StartRecord {
   owners: string[];
   startedAtMs: number;
   cleanup: boolean;
+  /** An explicit stop stays retryable until its caller acknowledges completion. */
+  stop?: "pending" | "closed";
+  /** A failed implicit waiter advances this revision; other callers cannot consume its retry. */
+  defaultStopRevision?: number;
   session?: { sessionId: string; browserInstanceId: string };
 }
 
@@ -105,10 +109,15 @@ export class DiskStartJournal implements StartJournal {
           !/^\d+:[a-f0-9-]{36}$/.test(item.requestId) ||
           !Array.isArray(item.owners) ||
           !item.owners.every((id: unknown) => typeof id === "string") ||
-          typeof item.startedAtMs !== "number"
+          typeof item.startedAtMs !== "number" ||
+          (item.stop !== undefined && item.stop !== "pending" && item.stop !== "closed") ||
+          (item.defaultStopRevision !== undefined &&
+            (!Number.isSafeInteger(item.defaultStopRevision) ||
+              item.defaultStopRevision < 0 ||
+              item.stop === undefined))
         )
           throw new Error(`Invalid browser start journal: ${file}`);
-        this.records.set(item.requestId, { ...item, cleanup: true });
+        this.records.set(item.requestId, { ...item, cleanup: item.stop !== "closed" });
       }
     }
     // A crash during adoption must not lose the already-renamed source.

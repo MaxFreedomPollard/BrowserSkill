@@ -82,6 +82,14 @@ recoverable on reload; `browser_session action=list` reports `pendingCleanup`, a
 can retry it even when there is no current session. This requires a CLI and daemon
 that support recoverable starts. See [the lifecycle contract](../../docs/recoverable-session-starts.md).
 
+Stops also retain their target and cleanup intent. A failed or interrupted stop can be
+retried without accidentally stopping the next current session. Once the intent is saved,
+cancelling the call only stops waiting; cleanup continues in the background. If it finishes
+before a retry, that retry acknowledges the original result. With several unacknowledged
+stops, pass `session` or the owned `requestId` explicitly (not both). List exposes request
+IDs; stop results include `requestId` and `alreadyClosed`. Completed receipts survive reload
+until acknowledged and do not occupy browser capacity.
+
 **Ownership boundary**: the bsk daemon may be shared with other agents, terminals, or dsh
 instances. The plugin therefore only ever sees and operates on sessions it created itself —
 an explicit `session` argument naming a foreign or unknown id is rejected, the `list` action on

@@ -1,103 +1,10 @@
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { registerBrowserTools } from "../src/browser-tools";
-import { ObservationService } from "../src/observation";
-import { KeyedExecutor } from "../src/queue";
-import type { BskRunOptions, BskRunResult } from "../src/runner";
-import { SessionStarts } from "../src/session-starts";
-import { SessionRegistry } from "../src/sessions";
-import { DiskStartJournal, memoryStartJournal, type StartJournal } from "../src/start-journal";
-import type { ToolDeps } from "../src/tools";
-
-const cleanups: Array<() => void | Promise<void>> = [];
-afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-});
-const ok = (body: unknown): BskRunResult => ({
-  code: 0,
-  stdout: JSON.stringify(body),
-  stderr: "",
-  aborted: false,
-  timedOut: false,
-});
-const failed = (message: string): BskRunResult => ({
-  code: 2,
-  stdout: JSON.stringify({ code: "protocol_error", message }),
-  stderr: "",
-  aborted: false,
-  timedOut: false,
-});
-const exec = (signal = new AbortController().signal) =>
-  ({
-    callId: "call",
-    name: "browser_session",
-    signal,
-    agent: { id: "conversation" },
-  }) as ToolRunContext;
-
-function harness(
-  run: (args: string[], options: BskRunOptions) => Promise<BskRunResult>,
-  journal: StartJournal = memoryStartJournal(),
-) {
-  const calls: Array<{ args: string[]; options: BskRunOptions }> = [];
-  const tools = new Map<string, ToolDefinition>();
-  const ctx = {
-    tools: {
-      register: (tool: ToolDefinition) => {
-        tools.set(tool.name, tool);
-        return () => {};
-      },
-    },
-    get: () => undefined,
-  };
-  const prepare = vi.fn(async () => ok({ state: "prepared" }));
-  const runner = {
-    run: async (args: string[], options: BskRunOptions = {}) => {
-      calls.push({ args, options });
-      if (args.includes("--prepare")) return prepare();
-      return run(args, options);
-    },
-    killAll: vi.fn(),
-    killFor: () => 0,
-  };
-  const registry = new SessionRegistry(5);
-  const queue = new KeyedExecutor();
-  const observation = new ObservationService({
-    ctx: ctx as never,
-    runner,
-    registry,
-    queue,
-    options: { enabled: true, thumbnailIntervalMs: 1500, idleIntervalMs: 8000 },
-  });
-  const deps: ToolDeps = {
-    ctx: ctx as never,
-    runner,
-    registry,
-    queue,
-    observation,
-    config: {
-      bskPath: "bsk",
-      defaultTimeoutMs: 120000,
-      maxSessions: 5,
-      observationEnabled: true,
-      thumbnailIntervalMs: 1500,
-      idleIntervalMs: 8000,
-      lazyTools: false,
-    },
-  };
-  const starts = (deps.starts = new SessionStarts(deps, journal));
-  registerBrowserTools(deps);
-  const session = (args: Record<string, unknown>, context = exec()) =>
-    tools.get("browser_session")!.execute(args, context);
-  cleanups.push(async () => {
-    await starts.dispose();
-    observation.dispose();
-  });
-  return { starts, registry, journal, calls, session, runner, prepare, tools, observation, queue };
-}
+import { describe, expect, it, vi } from "vitest";
+import type { BskRunResult } from "../src/runner";
+import { DiskStartJournal, memoryStartJournal } from "../src/start-journal";
+import { cleanups, exec, failed, harness, ok } from "./session-lifecycle-harness";
 
 describe("recoverable plugin starts", () => {
   it("publishes a session only after both initialization and claim succeed", async () => {

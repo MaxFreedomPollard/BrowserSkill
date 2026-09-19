@@ -19,7 +19,7 @@ import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import { sniffImageMediaType } from "./image";
 import type { KeyedExecutor } from "./queue";
-import { BskError, type BskRunner, parseBskJson, runWithSessionBusyRetry } from "./runner";
+import type { BskRunner } from "./runner";
 import type { SessionRegistry } from "./sessions";
 
 /** One owned session's live observation record (wire-stable shape). */
@@ -314,67 +314,6 @@ export class ObservationService {
   }
 
   /**
-   * Stop one owned session and close its Agent Window (the overlay's stop
-   * button — same end state as `browser_session` action=stop). Never waits behind a
-   * hung in-flight command: tool children are killed first so the session's
-   * keyed queue drains immediately, and no further captures queue up. A
-   * session the daemon already forgot stops idempotently — the goal state
-   * (entry gone) is identical.
-   * @returns false only for a foreign session; bsk failures reject so callers
-   * can preserve the structured error instead of silently leaving a ghost.
-   */
-  async stopSession(sessionId: string, signal?: AbortSignal): Promise<boolean> {
-    if (!this.deps.registry.isOwned(sessionId)) return false;
-    const requestId = this.deps.registry.requestFor(sessionId);
-    if (requestId) this.deps.registry.markForCleanup(sessionId);
-    const releaseForeground = this.acquireForeground(sessionId);
-    let actionError: string | undefined;
-    this.beginAction(sessionId, "stopping");
-    try {
-      this.deps.runner.killFor(sessionId);
-      const result = await this.deps.queue.run(
-        sessionId,
-        () =>
-          runWithSessionBusyRetry(
-            () =>
-              this.deps.runner.run(
-                requestId
-                  ? ["session", "request", requestId, "--cancel"]
-                  : ["session", "stop", sessionId],
-                {
-                  signal,
-                  timeoutMs: 30_000,
-                  tag: sessionId,
-                },
-              ),
-            signal,
-          ),
-        signal,
-      );
-      if (result.aborted) throw abortError();
-      try {
-        const reply = parseBskJson(result, "session stop") as {
-          state?: string;
-          cleanup_error?: string;
-        };
-        if (requestId && reply.state !== "closed" && reply.state !== "failed")
-          throw new Error(reply.cleanup_error ?? "Browser cleanup is still pending; retry stop.");
-      } catch (error) {
-        if (!isSessionNotFoundError(error)) throw error;
-      }
-      this.deps.registry.remove(sessionId);
-      this.removeSession(sessionId);
-      return true;
-    } catch (error) {
-      actionError = error instanceof Error ? error.message.split("\n")[0] : String(error);
-      throw error;
-    } finally {
-      this.endAction(sessionId, actionError);
-      releaseForeground();
-    }
-  }
-
-  /**
    * Read one captured thumbnail from the in-process ring. Powers the plugin's
    * own HTTP thumbnail route — frames are plugin-owned runtime data, never
    * referenced by any session log, so the session-authorized client RPC
@@ -555,16 +494,6 @@ export class ObservationService {
 
 function isSessionNotFoundCode(code: string | undefined): boolean {
   return code === "not_found" || code === "session_not_found";
-}
-
-function isSessionNotFoundError(error: unknown): boolean {
-  return error instanceof BskError && isSessionNotFoundCode(error.code);
-}
-
-function abortError(): Error {
-  const error = new Error("tool call aborted");
-  error.name = "AbortError";
-  return error;
 }
 
 /** Map a bsk command label onto its observation action verb. */

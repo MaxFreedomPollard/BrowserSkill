@@ -15,9 +15,7 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
-import type { ObservationService } from "./observation";
 import type { SessionStarts } from "./session-starts";
-import type { SessionRegistry } from "./sessions";
 
 /** The wire shape of a `domain/changed` frame (see dsh-storage-domain). */
 interface DomainChange {
@@ -66,9 +64,7 @@ export function ownerSessionIds(ctx: Context, agentId: string | undefined): stri
  */
 export function armArchiveCleanup(
   ctx: Context,
-  registry: SessionRegistry,
-  observation: ObservationService,
-  starts?: SessionStarts,
+  starts: Pick<SessionStarts, "archive">,
 ): () => void {
   // 'domain/changed' lives outside the vendored Events type map, so the
   // listener goes through a structural view of the events mixin.
@@ -102,16 +98,7 @@ export function armArchiveCleanup(
     );
     seen = new Set(archived.filter((id): id is string => typeof id === "string"));
     for (const dshSessionId of fresh) {
-      if (starts) {
-        starts.archive(dshSessionId);
-        continue;
-      }
-      for (const sessionId of registry.ownedByDsh(dshSessionId)) {
-        // stopSession owns the full teardown (kill in-flight tools, queue
-        // the daemon stop, drop registry + observation entries); a failure
-        // just leaves the session for idle timeout or unload cleanup.
-        void observation.stopSession(sessionId).catch(() => {});
-      }
+      starts.archive(dshSessionId);
     }
   });
 }

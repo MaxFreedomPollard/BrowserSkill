@@ -548,58 +548,15 @@ describe("interrupt routing", () => {
   });
 });
 
-describe("stopSession", () => {
-  it("stops an owned session: kills in-flight tools, runs session stop, removes the entry", async () => {
-    const registry = new SessionRegistry(5);
-    own(registry, "s1");
-    const runner = fakeRunner();
-    const { service, events } = setup({ registry, runner });
-    service.addSession("s1");
-    expect(registry.isOwned("s1")).toBe(true);
-
-    await expect(service.stopSession("s1")).resolves.toBe(true);
-    expect(runner.killed).toEqual(["observation:s1", "s1"]);
-    const stop = runner.calls.find((c) => c.args[0] === "session" && c.args[1] === "stop");
-    expect(stop?.args).toEqual(["session", "stop", "s1"]);
-    expect(registry.isOwned("s1")).toBe(false);
-    expect(service.getState()).toEqual([]);
-    expect(events[events.length - 1]).toMatchObject({ type: "remove" });
-  });
-
-  it("refuses foreign sessions without touching the runner", async () => {
-    const registry = new SessionRegistry(5);
-    own(registry, "s1");
-    const runner = fakeRunner();
-    const { service } = setup({ registry, runner });
-    await expect(service.stopSession("foreign")).resolves.toBe(false);
-    expect(runner.killed).toEqual([]);
-    expect(runner.calls).toEqual([]);
-  });
-
-  it("stops idempotently when the daemon already forgot the session (dead entries)", async () => {
-    const registry = new SessionRegistry(5);
-    own(registry, "s1");
-    const runner = fakeRunner({ stopNotFound: true });
-    const { service, events } = setup({ registry, runner });
-    service.addSession("s1");
-    await expect(service.stopSession("s1")).resolves.toBe(true);
-    expect(registry.isOwned("s1")).toBe(false);
-    expect(events[events.length - 1]).toMatchObject({ type: "remove" });
-  });
-
-  it("rejects and keeps the entry when the stop itself fails", async () => {
-    const registry = new SessionRegistry(5);
-    own(registry, "s1");
-    const runner = fakeRunner({ stopFails: true });
-    const { service } = setup({ registry, runner });
-    service.addSession("s1");
-    await expect(service.stopSession("s1")).rejects.toThrow(/boom/);
-    expect(registry.isOwned("s1")).toBe(true);
-    expect(service.getState().map((s) => s.sessionId)).toEqual(["s1"]);
-  });
-});
-
 describe("HTTP/SSE interface", () => {
+  // Route tests verify transport/forwarding; lifecycle entry tests exercise real cleanup.
+  const lifecycleFor = (service: ObservationService) => ({
+    stop: vi.fn(async ({ sessionId: id }: { sessionId?: string } = {}) => {
+      if (!id) throw new Error("session required");
+      service.removeSession(id);
+      return { stopped: id, requestId: `request-${id}`, alreadyClosed: false };
+    }),
+  });
   interface RecordedRoute {
     path: string;
     handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
@@ -669,7 +626,7 @@ describe("HTTP/SSE interface", () => {
 
     const { routes, webServer } = routeHarness();
     const ctx = { get: (key: string) => (key === "webServer" ? webServer : undefined) } as never;
-    const dispose = registerObservationRoutes(ctx, service);
+    const dispose = registerObservationRoutes(ctx, service, lifecycleFor(service));
 
     // state
     const stateRoute = routes.get("/bsk-observation/state");
@@ -720,7 +677,11 @@ describe("HTTP/SSE interface", () => {
     const { service, scheduler } = setup({ thumbnails: false });
     service.addSession("s1");
     const { routes, webServer } = routeHarness();
-    const dispose = registerObservationRoutes({ get: () => webServer } as never, service);
+    const dispose = registerObservationRoutes(
+      { get: () => webServer } as never,
+      service,
+      lifecycleFor(service),
+    );
     const route = routes.get("/bsk-observation/events")!;
     const metadata = fakeRes();
     await route.handler(fakeReq({ url: "/bsk-observation/events?thumbnails=0" }), metadata.res);
@@ -744,7 +705,11 @@ describe("HTTP/SSE interface", () => {
     const { service, scheduler } = setup({ thumbnails: false });
     service.addSession("s1");
     const { routes, webServer } = routeHarness();
-    const dispose = registerObservationRoutes({ get: () => webServer } as never, service);
+    const dispose = registerObservationRoutes(
+      { get: () => webServer } as never,
+      service,
+      lifecycleFor(service),
+    );
     const response = fakeRes();
     vi.spyOn(response.res, "write").mockImplementation(() => {
       throw new Error("closed socket");
@@ -763,7 +728,7 @@ describe("HTTP/SSE interface", () => {
     const { service } = setup({ registry });
     const { routes, webServer } = routeHarness();
     const ctx = { get: (key: string) => (key === "webServer" ? webServer : undefined) } as never;
-    const dispose = registerObservationRoutes(ctx, service);
+    const dispose = registerObservationRoutes(ctx, service, lifecycleFor(service));
 
     const stopRoute = routes.get("/bsk-observation/stop");
     const res = fakeRes();
@@ -790,7 +755,7 @@ describe("HTTP/SSE interface", () => {
     service.addSession("s1");
     const { routes, webServer } = routeHarness();
     const ctx = { get: (key: string) => (key === "webServer" ? webServer : undefined) } as never;
-    const dispose = registerObservationRoutes(ctx, service);
+    const dispose = registerObservationRoutes(ctx, service, lifecycleFor(service));
     const stateRoute = routes.get("/bsk-observation/state");
     const interruptRoute = routes.get("/bsk-observation/interrupt");
 
@@ -837,7 +802,7 @@ describe("HTTP/SSE interface", () => {
   it("registers nothing when no webServer is mounted", () => {
     const { service } = setup({});
     const ctx = { get: () => undefined } as never;
-    const dispose = registerObservationRoutes(ctx, service);
+    const dispose = registerObservationRoutes(ctx, service, lifecycleFor(service));
     expect(typeof dispose).toBe("function");
     dispose();
     service.dispose();

@@ -125,13 +125,13 @@ export function apply(
   // callback simply never runs, leaving the rest of the plugin unaffected).
   let removeRoutes: () => void = () => {};
   ctx.inject(["webServer"], (injected) => {
-    removeRoutes = registerObservationRoutes(injected, observation);
+    removeRoutes = registerObservationRoutes(injected, observation, starts);
     return () => removeRoutes();
   });
   // Reap a conversation's browsers when the conversation itself is archived:
   // archived sessions are hidden from every surface, so their Agent Windows
   // would otherwise linger unreachable until idle timeout or unload.
-  const disarmArchiveCleanup = armArchiveCleanup(ctx, registry, observation, starts);
+  const disarmArchiveCleanup = armArchiveCleanup(ctx, starts);
 
   // Non-blocking install probe: warn early when bsk is missing instead of
   // failing the first tool call with a bare spawn error. Uses --version on
