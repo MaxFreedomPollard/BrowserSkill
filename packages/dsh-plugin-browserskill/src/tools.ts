@@ -30,7 +30,7 @@ import {
 } from "./runner";
 import { SessionStarts } from "./session-starts";
 import type { SessionRegistry } from "./sessions";
-import { SESSION_PARAM } from "./tool-params";
+import { SESSION_PARAM, SESSION_STOP_PARAMS } from "./tool-params";
 
 /** Plugin configuration resolved from the Schemastery schema in index.ts. */
 export interface PluginConfig {
@@ -314,14 +314,7 @@ function defineBrowserOperations(deps: ToolDeps, register: DefinitionRegistrar):
         "selecting another session; specify session or requestId if several stops are pending. " +
         "A requestId identifies the original start even if its short session ID is reused. Once accepted, " +
         "cleanup continues if this call is aborted. Only plugin-created sessions can be stopped.",
-      parameters: {
-        session: SESSION_PARAM,
-        requestId: {
-          type: "string",
-          description:
-            "Owned lifecycle request ID to stop or acknowledge; mutually exclusive with session.",
-        },
-      },
+      parameters: SESSION_STOP_PARAMS,
       output: {
         schema: {
           type: "object",

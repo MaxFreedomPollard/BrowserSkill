@@ -247,6 +247,23 @@ describe("tool registration", () => {
     }
   });
 
+  it("exposes optional stop targets and retry guidance in the public session schema", () => {
+    const { tools } = setup({});
+    const tool = tools.get("browser_session")!;
+    const properties = tool.parameters.properties as Record<string, unknown> | undefined;
+    expect(properties?.requestId).toMatchObject({
+      type: "string",
+      description: expect.stringMatching(/stop.*mutually exclusive with session/i),
+    });
+    expect(properties?.session).toMatchObject({
+      type: "string",
+      description: expect.stringMatching(/unacknowledged stop.*current session/i),
+    });
+    expect(tool.parameters.required).toEqual(["action"]);
+    expect(tool.description).toMatch(/session or requestId/);
+    expect(tool.description).toMatch(/unacknowledged stop/);
+  });
+
   it("requires an action on every public tool", async () => {
     const { tools } = setup({});
     for (const name of Object.keys(EXPECTED_ACTIONS)) {
