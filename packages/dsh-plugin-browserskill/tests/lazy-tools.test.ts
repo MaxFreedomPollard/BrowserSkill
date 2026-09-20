@@ -3,24 +3,59 @@
 // idempotent on repeats, and torn down cleanly. Plus the apply-level
 // lazyTools two-state wiring.
 
-import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
+import { createToolResultMessage } from "@deepseek-ai/dsh-llm";
+import { Session, SessionId } from "@deepseek-ai/dsh-session";
+import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
 import { describe, expect, it, vi } from "vitest";
 import { apply } from "../src/index";
 import { armLazyTools, hasSuccessfulSkillInvocation } from "../src/lazy-tools";
-import type { BskRunOptions, BskRunResult } from "../src/runner";
+import type { BskRunResult } from "../src/runner";
 import { memoryStartJournal } from "../src/start-journal";
 
-function fakeEventCtx(sessions?: { list(): { events: unknown[] }[] }) {
+function fakeEventCtx(sessions?: {
+  list(): { events?: readonly unknown[]; snapshotEvents?(): readonly unknown[] }[];
+}) {
   const listeners = new Map<string, (...args: never[]) => void>();
+  let onSessionsReady: ((ctx: unknown) => void) | undefined;
   const ctx = {
     on: (event: string, listener: (...args: never[]) => void) => {
       listeners.set(event, listener);
       return () => listeners.delete(event);
     },
     get: (key: string) => (key === "sessions" ? sessions : undefined),
+    inject: (_deps: string[], callback: (ctx: unknown) => void) => {
+      onSessionsReady = callback;
+      return {
+        dispose: () => {
+          onSessionsReady = undefined;
+        },
+      };
+    },
   };
-  return { ctx: ctx as never, listeners };
+  return {
+    ctx: ctx as never,
+    listeners,
+    provideSessions(value: NonNullable<typeof sessions>) {
+      sessions = value;
+      onSessionsReady?.(ctx);
+    },
+  };
 }
+
+const skillCall = (callId = "skill-1") => ({
+  type: "tool/call",
+  data: { callId, name: "skill", arguments: '{"name":"browser-skill"}' },
+});
+const skillResult = (isError = false, callId = "skill-1") => ({
+  type: "tool/result",
+  data: {
+    message: createToolResultMessage({
+      callId: callId as never,
+      content: [{ type: "text", text: isError ? "skill unavailable" : "skill instructions" }],
+      isError,
+    }),
+  },
+});
 
 function callListeners(
   listeners: Map<string, (...args: never[]) => void>,
@@ -183,15 +218,18 @@ describe("armLazyTools", () => {
     );
     expect(registerSuite).toHaveBeenCalledTimes(1);
 
-    // Events arrive constantly; re-deriving from history on each one after the
-    // reveal would be pure waste. A session that would throw if read proves
-    // the history is not touched again.
+    // The implementation catches read failures, so assert the getter call count.
+    const readHistory = vi.fn(() => {
+      throw new Error("session history must not be read after the reveal");
+    });
     const exploding = {
       get events(): never {
-        throw new Error("session history must not be read after the reveal");
+        return readHistory();
       },
     };
     callListeners(listeners, "session/event", exploding, { type: "message/append" });
+    callListeners(listeners, "session/created", exploding);
+    expect(readHistory).not.toHaveBeenCalled();
     expect(registerSuite).toHaveBeenCalledTimes(1);
   });
 
@@ -206,12 +244,193 @@ describe("armLazyTools", () => {
       { isError: false },
     );
     disarm();
+    disarm();
     expect(suiteDispose).toHaveBeenCalledTimes(1);
     expect(listeners.size).toBe(0);
+  });
+
+  it("restores current DSH history when a missed session later emits an ordinary event", () => {
+    const { ctx, listeners } = fakeEventCtx();
+    const registerSuite = vi.fn(() => () => {});
+    armLazyTools(ctx, registerSuite);
+    const session = { events: [skillCall(), skillResult()] };
+    callListeners(listeners, "session/event", session, { type: "turn/start", data: {} });
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores as soon as a late sessions service becomes available", () => {
+    const host = fakeEventCtx();
+    const registerSuite = vi.fn(() => () => {});
+    const disarm = armLazyTools(host.ctx, registerSuite);
+    host.provideSessions({ list: () => [{ events: [skillCall(), skillResult()] }] });
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+    disarm();
+    host.provideSessions({ list: () => [{ events: [skillCall(), skillResult()] }] });
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores from the newer DSH snapshotEvents API", () => {
+    const session = { snapshotEvents: vi.fn(() => [skillCall(), skillResult()]) };
+    const { ctx } = fakeEventCtx({ list: () => [session] });
+    const registerSuite = vi.fn(() => () => {});
+    armLazyTools(ctx, registerSuite);
+    expect(session.snapshotEvents).toHaveBeenCalledTimes(1);
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+  });
+
+  it("consumes new events without taking another snapshot on newer DSH", () => {
+    const session = { snapshotEvents: vi.fn(() => [skillCall()]) };
+    const { ctx, listeners } = fakeEventCtx({ list: () => [session] });
+    const registerSuite = vi.fn(() => () => {});
+    armLazyTools(ctx, registerSuite);
+    for (let i = 0; i < 20_000; i++) {
+      callListeners(listeners, "session/event", session, { type: "assistant/chunk" });
+    }
+    expect(registerSuite).not.toHaveBeenCalled();
+    callListeners(listeners, "session/event", session, skillResult());
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+    expect(session.snapshotEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it("scans a long uninvoked session once and then consumes live call/results", () => {
+    const session = Session.create(SessionId("streaming"));
+    const readHistory = vi.spyOn(session, "events", "get");
+    const { ctx, listeners } = fakeEventCtx({ list: () => [session] });
+    const registerSuite = vi.fn(() => () => {});
+    armLazyTools(ctx, registerSuite);
+    for (let i = 0; i < 20_000; i++) {
+      const event = session.append("assistant/chunk", {
+        turn: 0,
+        step: 0,
+        chunk: { type: "text-delta", index: 0, text: "x" },
+      });
+      callListeners(listeners, "session/event", session, event);
+    }
+    callListeners(listeners, "session/created", session);
+    expect(readHistory).toHaveBeenCalledTimes(1);
+    expect(registerSuite).not.toHaveBeenCalled();
+
+    callListeners(listeners, "session/event", session, skillCall());
+    callListeners(listeners, "session/event", session, skillResult(true));
+    // A failed call is settled; a later result alone cannot turn it into proof.
+    callListeners(listeners, "session/event", session, skillResult());
+    expect(registerSuite).not.toHaveBeenCalled();
+    callListeners(listeners, "session/event", session, skillCall("retry"));
+    callListeners(listeners, "session/event", session, skillResult(false, "retry"));
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+    expect(readHistory).toHaveBeenCalledTimes(1);
+    readHistory.mockRestore();
+  });
+
+  it("pairs a result arriving after the first scan with an earlier pending call", () => {
+    const session = { events: [skillCall()] };
+    const { ctx, listeners } = fakeEventCtx({ list: () => [session] });
+    const registerSuite = vi.fn(() => () => {});
+    armLazyTools(ctx, registerSuite);
+    expect(registerSuite).not.toHaveBeenCalled();
+    callListeners(listeners, "session/event", session, skillResult());
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps call correlation local to each session object", () => {
+    const first = { events: [skillCall()] };
+    const second = { events: [] };
+    const { ctx, listeners } = fakeEventCtx({ list: () => [first, second] });
+    const registerSuite = vi.fn(() => () => {});
+    armLazyTools(ctx, registerSuite);
+    callListeners(listeners, "session/event", second, skillResult());
+    expect(registerSuite).not.toHaveBeenCalled();
+    callListeners(listeners, "session/event", first, skillResult());
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries unreadable history without caching the failure as an empty scan", () => {
+    const history = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("history not ready");
+      })
+      .mockReturnValue([skillCall(), skillResult()]);
+    const session = {
+      get events() {
+        return history();
+      },
+    };
+    const { ctx, listeners } = fakeEventCtx({ list: () => [session] });
+    const registerSuite = vi.fn(() => () => {});
+    armLazyTools(ctx, registerSuite);
+    expect(registerSuite).not.toHaveBeenCalled();
+    callListeners(listeners, "session/event", session, { type: "turn/start" });
+    expect(history).toHaveBeenCalledTimes(2);
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers after a startup registry failure", () => {
+    const { ctx, listeners } = fakeEventCtx({
+      list() {
+        throw new Error("registry unavailable");
+      },
+    });
+    const registerSuite = vi.fn(() => () => {});
+    expect(() => armLazyTools(ctx, registerSuite)).not.toThrow();
+    callListeners(
+      listeners,
+      "session/event",
+      { events: [skillCall(), skillResult()] },
+      { type: "turn/start" },
+    );
+    expect(registerSuite).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries registration on the next event without re-reading successful history", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const history = vi.fn(() => [skillCall(), skillResult()]);
+    const session = {
+      get events() {
+        return history();
+      },
+    };
+    const { ctx, listeners } = fakeEventCtx({ list: () => [session] });
+    const registerSuite = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("registration failed");
+      })
+      .mockReturnValue(() => {});
+    try {
+      armLazyTools(ctx, registerSuite);
+      callListeners(listeners, "session/event", session, { type: "turn/start" });
+      expect(registerSuite).toHaveBeenCalledTimes(2);
+      expect(history).toHaveBeenCalledTimes(1);
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
 
 describe("hasSuccessfulSkillInvocation", () => {
+  it("recognizes official DSH result messages and requires successful matching calls", () => {
+    expect(hasSuccessfulSkillInvocation([skillCall(), skillResult()])).toBe(true);
+    expect(hasSuccessfulSkillInvocation([skillCall(), skillResult(true)])).toBe(false);
+    expect(hasSuccessfulSkillInvocation([skillCall(), skillResult(false, "other")])).toBe(false);
+    expect(hasSuccessfulSkillInvocation([skillResult(), skillCall()])).toBe(false);
+    expect(hasSuccessfulSkillInvocation([skillResult()])).toBe(false);
+  });
+
+  it("rejects missing identities and inconsistent modern result blocks", () => {
+    expect(
+      hasSuccessfulSkillInvocation([
+        { type: "tool/call", data: { name: "skill", arguments: { name: "browser-skill" } } },
+        { type: "tool/result", data: { message: { isError: false } } },
+      ]),
+    ).toBe(false);
+    const message = structuredClone(skillResult().data.message);
+    message.content[0].toolCallId = "different" as never;
+    expect(
+      hasSuccessfulSkillInvocation([skillCall(), { type: "tool/result", data: { message } }]),
+    ).toBe(false);
+  });
+
   it("pairs call and result by callId and honors gestures", () => {
     expect(hasSuccessfulSkillInvocation([])).toBe(false);
     expect(
@@ -251,7 +470,7 @@ describe("lazyTools wiring in apply()", () => {
     const ctx = {
       tools: { register: (def: ToolDefinition) => tools.set(def.name, def) },
       get: () => undefined,
-      inject: () => {},
+      inject: () => ({ dispose() {} }),
       effect: () => {},
       on: (event: string, listener: (...args: never[]) => void) => {
         listeners.set(event, listener);

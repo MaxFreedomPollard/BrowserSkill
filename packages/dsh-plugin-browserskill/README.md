@@ -147,6 +147,11 @@ the model. The six `browser_*` tool schemas are added to the system prompt after
 the `browser-skill` skill is successfully invoked, either by the model or through
 `/browser-skill`. Set `lazyTools: false` to make the tools available immediately.
 
+After a plugin reload, a live or resumed conversation's successful skill invocation
+restores the tools from its stored history. If an older plugin reports
+`unknown tool "browser_session"`, invoke `skill browser-skill` again, or set
+`lazyTools: false` in the profile patch as a temporary workaround.
+
 ## Live browser view
 
 The dsh Web UI prefers a **Browser Skill** tab in DSH's native right sidebar.
