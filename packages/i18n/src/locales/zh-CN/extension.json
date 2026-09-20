@@ -119,7 +119,7 @@
       "hint": "确认当前是你要使用的浏览器个人资料，再将此处的指令发给 Agent。",
       "copyButton": "复制此 Profile 的指令",
       "copyFailed": "复制指令失败，请重试。",
-      "promptTemplate": "本次任务请使用此浏览器个人资料中的 BrowserSkill。为本次任务创建每个新会话时都执行：{{command}}\n如果此实例未连接，请停止并让我重新连接此 Profile。不要省略 --browser，也不要切换到其他实例。"
+      "promptTemplate": "本次任务请使用此浏览器个人资料中的 BrowserSkill。为本次任务创建每个新会话时，请使用对应接口：\nCLI：{{command}}\nDeepSeek Harness：{{toolCall}}\n在 DeepSeek Harness 中请使用工具调用，不要另行执行 CLI 命令。\n如果此实例未连接，请停止并让我重新连接此 Profile。不要省略 --browser / browser，也不要切换到其他实例。"
     }
   },
   "controlOverlay": {

@@ -21,8 +21,10 @@ describe("profile instructions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy profile instructions" }));
     const text = vi.mocked(navigator.clipboard.writeText).mock.calls[0]?.[0];
     expect(text).toContain("bsk session start --browser a1234567 --json");
+    expect(text).toContain('browser_session({ action: "start", browser: "a1234567" })');
+    expect(text).toContain("use the tool call instead of running the CLI command separately");
     expect(text).toContain("every new session for this task");
-    expect(text).toContain("Do not omit --browser or switch to another instance");
+    expect(text).toContain("Do not omit --browser / browser or switch to another instance");
     expect(await screen.findByRole("status")).toBeTruthy();
   });
   it.each([
@@ -53,6 +55,9 @@ describe("profile instructions", () => {
     expect(vi.mocked(navigator.clipboard.writeText).mock.calls[1]?.[0]).toContain(
       "bsk session start --browser b1234567 --json",
     );
+    expect(vi.mocked(navigator.clipboard.writeText).mock.calls[1]?.[0]).toContain(
+      'browser_session({ action: "start", browser: "b1234567" })',
+    );
   });
   it("reports clipboard failure and allows retry without claiming success", async () => {
     vi.mocked(navigator.clipboard.writeText).mockRejectedValueOnce(new Error("clipboard denied"));
@@ -70,6 +75,9 @@ describe("profile instructions", () => {
     fireEvent.click(screen.getByRole("button"));
     expect(vi.mocked(navigator.clipboard.writeText).mock.calls[0]?.[0]).toContain(
       "bsk session start --browser a1234567 --json",
+    );
+    expect(vi.mocked(navigator.clipboard.writeText).mock.calls[0]?.[0]).toContain(
+      'browser_session({ action: "start", browser: "a1234567" })',
     );
     expect(await screen.findByRole("status")).toBeTruthy();
   });

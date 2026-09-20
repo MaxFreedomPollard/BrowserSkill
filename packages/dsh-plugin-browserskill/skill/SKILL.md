@@ -10,9 +10,31 @@ Do not control the browser through another process. Use the loaded action schema
 
 For remote setup or pairing, follow the [remote guide](https://github.com/Tencent/BrowserSkill/blob/main/docs/remote-extension-connection.md) before using these tools.
 
+## Required browser profiles
+
+If the user or workspace requires a specific profile, confirm its instance ID before
+starting, even with only one connected browser. If unknown, ask the user to open the
+intended profile, check **Profile Path** at `chrome://version` if a directory was
+specified, and copy the **Instance ID** or **Copy profile instructions** from the
+connected BrowserSkill popup in that same profile. Connected alone and Chrome's
+process arguments do not prove the profile.
+
+Use the verified ID (or verified unique BrowserSkill label) on every new session:
+
+```text
+browser_session({ action: "start", browser: "<verified-instance-id>" })
+```
+
+If the copied instructions contain a command-line example, use its instance ID in
+this tool call; do not run that command separately. A Chrome profile name, directory,
+or extension ID is not an instance ID. If the mapping is unclear, ambiguous, or the
+target is unavailable, stop and ask the user to confirm or reconnect it. Never omit
+`browser` or substitute another instance to recover.
+
 ## Mandatory workflow
 
-1. Define success. Start a session and retain `sessionId`. For a new page:
+1. Define success. Start a session and retain `sessionId`. Include `browser` as above
+   when a profile is required. Otherwise, for a new page:
 
    ```text
    browser_session({ action: "start" })
@@ -83,7 +105,8 @@ unknown effects or switch backends to bypass limits. Borrow confirmation still a
   again (users can enter `/browser-skill`), then retry the intended browser tool once
   after its schema appears. If it remains unavailable, report the failure.
 - Stale ref: observe, then retry the intended action once.
-- Unknown tab/session: list owned resources or start a session; never guess IDs.
+- Unknown tab/session: list owned resources or start a session with the required
+  browser selector, if any; never guess IDs.
 - Failed or interrupted session stop: accepted cleanup continues in the background.
   Retry the same stop; a completed previous stop returns `alreadyClosed: true`.
   If several stops are pending, specify `session` or the owned `requestId` from the

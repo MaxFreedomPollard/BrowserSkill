@@ -37,6 +37,29 @@ the instance ID; verify the mapping again instead of substituting another browse
 Copying a whole profile can also copy its extension storage, so instance IDs are
 routing identifiers, not independent proof of a filesystem path.
 
+## DeepSeek Harness
+
+Use the verified popup instance ID in the plugin's session tool:
+
+```text
+browser_session({ action: "start", browser: "<verified-instance-id>" })
+```
+
+**Copy profile instructions** includes this tool call alongside the CLI command.
+Use the DeepSeek Harness call instead of running a separate CLI session. The plugin
+manages its own sessions. Supply the same selector on every new session for the task, even if
+only one browser is connected. If the mapping is unknown or the target is offline,
+ask the user to confirm or reconnect it; do not retry without `browser`.
+
+## Scope and limitations
+
+This is a manual profile-to-instance workflow, not automatic profile discovery or
+a persisted task/workspace requirement. Explicit selectors reject unavailable or
+ambiguous targets. Neither the CLI nor the DSH plugin can infer a profile requirement
+from the user's conversation if the agent omits the selector: with only one browser
+connected, an unqualified start can still select the wrong profile. The skill and
+copied instructions guide the agent; they do not enforce a binding on future calls.
+
 ## Windows and macOS
 
 The instance-selection workflow is the same on both platforms. The profile path

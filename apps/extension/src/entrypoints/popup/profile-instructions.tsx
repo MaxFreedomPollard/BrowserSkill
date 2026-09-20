@@ -25,6 +25,7 @@ export function ProfileInstructions({
       await navigator.clipboard.writeText(
         t("popup.profile.promptTemplate", {
           command: `bsk session start --browser ${instanceId} --json`,
+          toolCall: `browser_session({ action: "start", browser: ${JSON.stringify(instanceId)} })`,
         }),
       );
       setFeedback({ instanceId, kind: "copied" });
