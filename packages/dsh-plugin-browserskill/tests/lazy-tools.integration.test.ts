@@ -5,6 +5,50 @@ import { describe, expect, it, vi } from "vitest";
 import { armLazyTools } from "../src/lazy-tools";
 
 describe("lazy tools with the DSH session lifecycle", () => {
+  it("retries a failed reveal on a real turn boundary instead of each streamed chunk", async () => {
+    const root = new Context();
+    const sessions = root.plugin(SessionStore);
+    await sessions;
+    const session = sessions.ctx.sessions.create(SessionId("registration-retry"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const registerSuite = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("registration unavailable");
+      })
+      .mockReturnValue(() => {});
+    const mounted = root.plugin((ctx) => {
+      const disarm = armLazyTools(ctx, registerSuite);
+      ctx.effect(() => disarm);
+    });
+    await mounted;
+    try {
+      session.append(
+        "user/message",
+        createUserMessage({
+          content: [{ type: "text", text: "skill instructions" }],
+          source: { kind: "skill-invocation", name: "browser-skill", form: "instructions" },
+        }),
+        { surfaceOp: "append" },
+      );
+      for (let i = 0; i < 20_000; i++) {
+        session.append("assistant/chunk", {
+          turn: 0,
+          step: 0,
+          chunk: { type: "text-delta", index: 0, text: "x" },
+        });
+      }
+      expect(registerSuite).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledTimes(1);
+      session.append("turn/start", { turn: 1 });
+      expect(registerSuite).toHaveBeenCalledTimes(2);
+    } finally {
+      await mounted.dispose();
+      await sessions.dispose();
+      warning.mockRestore();
+    }
+  });
+
   it("restores a successful model invocation after a real Cordis plugin unload/reload", async () => {
     const root = new Context();
     const sessions = root.plugin(SessionStore);

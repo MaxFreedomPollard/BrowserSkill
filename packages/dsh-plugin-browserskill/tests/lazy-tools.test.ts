@@ -382,7 +382,7 @@ describe("armLazyTools", () => {
     expect(registerSuite).toHaveBeenCalledTimes(1);
   });
 
-  it("retries registration on the next event without re-reading successful history", () => {
+  it("retries registration on the next turn without re-reading successful history", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const history = vi.fn(() => [skillCall(), skillResult()]);
     const session = {
@@ -403,6 +403,62 @@ describe("armLazyTools", () => {
       expect(registerSuite).toHaveBeenCalledTimes(2);
       expect(history).toHaveBeenCalledTimes(1);
     } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it.each([
+    "history",
+    "tool result",
+    "gesture",
+  ] as const)("defers failed registration from %s during streaming and recovers on the next turn", (trigger) => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const history = vi.fn(() => (trigger === "history" ? [skillCall(), skillResult()] : []));
+    const session = {
+      get events() {
+        return history();
+      },
+    };
+    const { ctx, listeners } = fakeEventCtx({ list: () => [session] });
+    let available = false;
+    const registerSuite = vi.fn(() => {
+      if (!available) throw new Error("registration unavailable");
+      return () => {};
+    });
+    const disarm = armLazyTools(ctx, registerSuite);
+    try {
+      if (trigger === "tool result") {
+        callListeners(
+          listeners,
+          "tools/result",
+          { name: "skill", arguments: { name: "browser-skill" } },
+          { isError: false },
+        );
+      } else if (trigger === "gesture") {
+        callListeners(listeners, "session/event", session, {
+          type: "user/message",
+          data: { source: { kind: "skill-invocation", name: "browser-skill" } },
+        });
+      }
+      expect(registerSuite).toHaveBeenCalledTimes(1);
+      for (let i = 0; i < 20_000; i++) {
+        callListeners(listeners, "session/event", session, { type: "assistant/chunk" });
+      }
+      expect(registerSuite).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(history).toHaveBeenCalledTimes(1);
+
+      // A live result/gesture may not be in the first snapshot. Keep its
+      // successful invocation proof, without retrying registration per token.
+      available = true;
+      callListeners(listeners, "session/event", session, { type: "turn/start" });
+      expect(registerSuite).toHaveBeenCalledTimes(2);
+      callListeners(listeners, "session/event", session, { type: "assistant/chunk" });
+      expect(registerSuite).toHaveBeenCalledTimes(2);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(history).toHaveBeenCalledTimes(1);
+    } finally {
+      disarm();
       warning.mockRestore();
     }
   });

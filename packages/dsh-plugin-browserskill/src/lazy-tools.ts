@@ -151,20 +151,21 @@ export function hasSuccessfulSkillInvocation(events: readonly SessionEventLike[]
  */
 export function armLazyTools(ctx: Context, registerSuite: () => () => void): () => void {
   let disposed = false;
-  let revealRequested = false;
+  let revealPending = false;
   let sessionStates = new WeakMap<SessionLike, SkillInvocationState>();
   let suiteDisposer: (() => void) | undefined;
   const disposers: (() => void)[] = [];
   const ensureSuite = (): void => {
     if (disposed || suiteDisposer !== undefined) return;
-    revealRequested = true;
     try {
       suiteDisposer = registerSuite();
+      revealPending = false;
       sessionStates = new WeakMap();
     } catch (error) {
-      // A failed reveal must not strand the plugin: stay hidden, log, retry on
-      // the next trigger instead of latching a half-registered suite.
+      // Keep successful invocation proof, but retry only at a lifecycle
+      // boundary or a new invocation, never on every streaming chunk.
       suiteDisposer = undefined;
+      revealPending = true;
       console.warn(
         `[dsh-plugin-browserskill] lazy tool registration failed: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -203,7 +204,7 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
 
   const scanSession = (session: SessionLike): void => {
     if (disposed || suiteDisposer !== undefined) return;
-    if (revealRequested || stateFor(session)?.successful) ensureSuite();
+    if (revealPending || stateFor(session)?.successful) ensureSuite();
   };
 
   // Live gesture/append feed: covers /browser-skill user gestures (no tool
@@ -211,7 +212,7 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
   const onSessionEvent = (session: SessionLike, event: SessionEventLike): void => {
     if (disposed || suiteDisposer !== undefined) return;
     if (
-      revealRequested ||
+      (revealPending && event?.type === "turn/start") ||
       (event?.type === "user/message" && isSkillInvocationMessage(event.data))
     ) {
       ensureSuite();
@@ -222,7 +223,7 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
     // existing history once; never read/copy the log on subsequent tokens.
     const state = stateFor(session);
     state?.consume(event);
-    if (state?.successful) ensureSuite();
+    if (state?.successful && !revealPending) ensureSuite();
   };
   disposers.push(ctx.on("session/event" as never, onSessionEvent as never));
 

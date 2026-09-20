@@ -39,6 +39,9 @@ getter. It then folds new events without reading or copying the full log on
 streaming updates. Pending call IDs are isolated by session and removed when their
 results arrive. A failed history read is retried on a later event; sessions missed
 at startup are discovered through service readiness or their first later event.
+Failed registration retains the invocation proof and retries on the next turn,
+session entry, service discovery, or successful skill invocation. Streaming
+events continue to fold without repeated registration attempts or warnings.
 
 ## Observation subscriptions and routes
 
