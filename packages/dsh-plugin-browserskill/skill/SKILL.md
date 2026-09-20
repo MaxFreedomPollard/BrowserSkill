@@ -79,6 +79,9 @@ unknown effects or switch backends to bypass limits. Borrow confirmation still a
 
 ## Recover
 
+- Unknown browser tool after plugin reload: invoke `skill` with `name: "browser-skill"`
+  again (users can enter `/browser-skill`), then retry the intended browser tool once
+  after its schema appears. If it remains unavailable, report the failure.
 - Stale ref: observe, then retry the intended action once.
 - Unknown tab/session: list owned resources or start a session; never guess IDs.
 - Failed or interrupted session stop: accepted cleanup continues in the background.
