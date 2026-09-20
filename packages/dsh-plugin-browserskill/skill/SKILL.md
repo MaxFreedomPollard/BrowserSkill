@@ -81,6 +81,11 @@ unknown effects or switch backends to bypass limits. Borrow confirmation still a
 
 - Stale ref: observe, then retry the intended action once.
 - Unknown tab/session: list owned resources or start a session; never guess IDs.
+- Failed or interrupted session stop: accepted cleanup continues in the background.
+  Retry the same stop; a completed previous stop returns `alreadyClosed: true`.
+  If several stops are pending, specify `session` or the owned `requestId` from the
+  result/list/error (not both). A request ID targets the original operation even if
+  the short session ID is reused. Never switch to another session just to retry cleanup.
 - Timeout/unknown effect: inspect before retrying; the action may have happened.
 - Unconfirmed fill: read the field. Formatting may satisfy the goal; correct only a
   remaining difference instead of blindly refilling or requesting help.
