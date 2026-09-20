@@ -232,10 +232,20 @@ export function armLazyTools(ctx: Context, registerSuite: () => () => void): () 
   disposers.push(ctx.on("session/created" as never, onSessionCreated as never));
   const scanExisting = (context: Context): void => {
     if (disposed || suiteDisposer !== undefined) return;
+    // Invocation proof is already retained: retry once for this discovery,
+    // independently of how many sessions the registry currently contains.
+    if (revealPending) {
+      ensureSuite();
+      return;
+    }
     try {
       const sessions = context.get("sessions") as SessionsLike | null | undefined;
       if (sessions != null && typeof sessions.list === "function") {
-        for (const session of sessions.list()) scanSession(session);
+        for (const session of sessions.list()) {
+          scanSession(session);
+          // A failed attempt also ends this batch; later lifecycle events retry.
+          if (revealPending || suiteDisposer !== undefined) break;
+        }
       }
     } catch {
       // An unavailable registry must not prevent later session/event recovery.

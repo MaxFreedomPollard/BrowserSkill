@@ -408,6 +408,58 @@ describe("armLazyTools", () => {
   });
 
   it.each([
+    "startup",
+    "service injection",
+  ] as const)("attempts registration once per session batch discovered through %s", (trigger) => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sessions = Array.from({ length: 100 }, (_, index) => ({
+      snapshotEvents: vi.fn(() => (index === 3 ? [skillCall(), skillResult()] : [])),
+    }));
+    const registry = { list: vi.fn(() => sessions) };
+    const host = fakeEventCtx(trigger === "startup" ? registry : undefined);
+    let available = false;
+    const suiteDispose = vi.fn();
+    const registerSuite = vi.fn(() => {
+      if (!available) throw new Error("registration unavailable");
+      return suiteDispose;
+    });
+    const disarm = armLazyTools(host.ctx, registerSuite);
+    try {
+      if (trigger === "service injection") host.provideSessions(registry);
+      expect(registerSuite).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledTimes(1);
+      for (const [index, session] of sessions.entries()) {
+        expect(session.snapshotEvents).toHaveBeenCalledTimes(index <= 3 ? 1 : 0);
+      }
+
+      // Pending recovery is global: one later batch means one retry,
+      // without enumerating or scanning the remaining sessions.
+      host.provideSessions(registry);
+      expect(registerSuite).toHaveBeenCalledTimes(2);
+      expect(warning).toHaveBeenCalledTimes(2);
+      expect(registry.list).toHaveBeenCalledTimes(1);
+
+      // The successful invocation proof survives repeated failures even
+      // when the next discovery no longer lists the original session.
+      available = true;
+      const emptyRegistry = { list: vi.fn(() => []) };
+      host.provideSessions(emptyRegistry);
+      expect(registerSuite).toHaveBeenCalledTimes(3);
+      expect(warning).toHaveBeenCalledTimes(2);
+      expect(emptyRegistry.list).not.toHaveBeenCalled();
+      host.provideSessions(registry);
+      expect(registerSuite).toHaveBeenCalledTimes(3);
+      for (const [index, session] of sessions.entries()) {
+        expect(session.snapshotEvents).toHaveBeenCalledTimes(index <= 3 ? 1 : 0);
+      }
+    } finally {
+      disarm();
+      warning.mockRestore();
+    }
+    expect(suiteDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
     "history",
     "tool result",
     "gesture",
