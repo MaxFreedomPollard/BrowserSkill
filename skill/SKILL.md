@@ -47,12 +47,34 @@ environment settings may not persist between shell calls. Keep browser commands
 sandboxed. For other startup failures, retry once, then use `bsk doctor`.
 A local process identity warning permits browser commands when IPC works.
 
+## Required browser profiles
+
+When the user requires a particular browser profile, bind the task to that
+profile's extension instance before starting a session, even if only one browser
+is connected. A Chrome profile name or directory is not a BrowserSkill instance
+ID or an automatically assigned label.
+
+Use the instance ID from the BrowserSkill popup in the required profile. The user
+can choose **Copy profile instructions** there and send the resulting instruction.
+If only a profile name/path is supplied and its mapping is unknown, ask the user
+to open that profile, verify its Profile Path at `chrome://version`, and copy the
+profile instructions. Do not infer the mapping from a single Connected browser
+or Chrome process command lines.
+
+Run `bsk browsers --json` to check that the supplied instance is connected, then
+pass `--browser <instance-id>` on every new session for this task. A previously
+verified unique label also works. If the target is missing or ambiguous, stop and
+report it; never omit the selector or substitute another instance to recover.
+Opening another Chrome profile does not retarget an existing session. After an
+extension reinstall or storage reset, obtain the instance mapping again.
+
 ## Task workflow
 
-1. Define success from the user's request. Start `bsk session start --json` and
-   retain its `session_id`. With multiple browsers, run `bsk browsers` and add
-   `--browser <id-or-label>` to start. For background work, add `--no-focus` to
-   `session start` only.
+1. Define success from the user's request. For a required browser profile, follow
+   **Required browser profiles** above and start with its explicit `--browser`
+   selector. Otherwise start `bsk session start --json`; with multiple browsers,
+   run `bsk browsers` and choose `--browser <id-or-label>`. Retain the returned
+   `session_id`. For background work, add `--no-focus` to `session start` only.
 2. For a new page, navigate; for an existing user tab, follow **Borrowing** below.
    Read the page before interacting:
 
