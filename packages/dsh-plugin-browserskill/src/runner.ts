@@ -47,6 +47,7 @@ export interface BskRunResult {
 
 export interface BskRunOptions {
   signal?: AbortSignal;
+  /** Execution timeout; after exit, output collection has a separate 2s limit. */
   timeoutMs?: number;
   /** Opaque routing tag (e.g. a session id) enabling per-tag kills. */
   tag?: string;
@@ -62,9 +63,9 @@ export type SpawnImpl = (
 export interface BskRunner {
   /** Run `bsk <args...> --json` and collect its output. */
   run(args: string[], options?: BskRunOptions): Promise<BskRunResult>;
-  /** Kill every in-flight child (used when the plugin unloads). */
+  /** Kill every still-running child (used when the plugin unloads). */
   killAll(): void;
-  /** Kill only the in-flight children carrying this tag; returns how many were killed. */
+  /** Kill running children carrying this tag; returns the number matched. */
   killFor(tag: string): number;
 }
 
@@ -94,7 +95,7 @@ const SESSION_BUSY_RETRY_DELAY_MS = 100;
 /** One in-flight child plus the bounded shutdown that settles its run. */
 interface LiveRun {
   tag: string | undefined;
-  requestKill: () => void;
+  requestKill: () => boolean;
 }
 
 export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): BskRunner {
@@ -210,16 +211,15 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
         // the child never reports back: `exit` normally arrives promptly, and the
         // deadline covers a child that reports nothing at all after SIGKILL.
         const requestKill = () => {
-          if (child.exitCode !== null || child.signalCode !== null) {
-            // The process is already gone; only pipes held by a grandchild remain.
-            finish(child.exitCode);
-            return;
-          }
+          // An exited command may still be draining its result. An interrupt
+          // cannot stop it anymore and must not discard the remaining output.
+          if (settled || child.exitCode !== null || child.signalCode !== null) return false;
           killChild(child);
           if (!settled && deadline === undefined) {
             deadline = setTimeout(() => finish(child.exitCode), settleAfterKillMs);
             deadline.unref();
           }
+          return true;
         };
         live.set(child, { tag: options.tag, requestKill });
 
@@ -227,6 +227,7 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
         const timer =
           timeoutMs !== undefined && timeoutMs > 0
             ? setTimeout(() => {
+                if (child.exitCode !== null || child.signalCode !== null) return;
                 timedOut = true;
                 requestKill();
               }, timeoutMs)
@@ -234,8 +235,10 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
         timer?.unref();
 
         const onAbort = () => {
+          if (settled) return;
           aborted = true;
-          requestKill();
+          // Explicit cancellation also stops waiting for an exited child's output.
+          if (!requestKill()) finish(child.exitCode);
         };
         const settle = () => {
           if (timer !== undefined) clearTimeout(timer);
@@ -252,6 +255,8 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
         };
 
         const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+          // Execution is over; output collection has its own bounded deadline.
+          if (timer !== undefined) clearTimeout(timer);
           if (signal !== null || timedOut || aborted) {
             // Killed on our initiative: nothing left worth draining.
             finish(code);
@@ -284,10 +289,7 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
     killFor(tag: string) {
       let killed = 0;
       for (const run of live.values()) {
-        if (run.tag === tag) {
-          run.requestKill();
-          killed += 1;
-        }
+        if (run.tag === tag && run.requestKill()) killed += 1;
       }
       return killed;
     },

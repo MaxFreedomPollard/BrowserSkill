@@ -238,7 +238,7 @@ describe("createBskRunner", () => {
     const child = new FakeChild();
     const runner = createBskRunner("bsk", fakeSpawn([child]));
     let result: BskRunResult | undefined;
-    void runner.run(["session", "start"]).then((r) => {
+    void runner.run(["session", "start"], { timeoutMs: 100 }).then((r) => {
       result = r;
     });
     child.exitCode = 0;
@@ -254,7 +254,7 @@ describe("createBskRunner", () => {
     expect(result?.stdout).toBe("x".repeat(10));
   });
 
-  it("settles immediately on timeout when the process already exited", async () => {
+  it("uses the drain deadline after the process exits before timeout", async () => {
     vi.useFakeTimers();
     const child = new FakeChild();
     const runner = createBskRunner("bsk", fakeSpawn([child]));
@@ -264,9 +264,12 @@ describe("createBskRunner", () => {
     });
     child.exitCode = 0;
     child.emit("exit", 0, null);
-    await vi.advanceTimersByTimeAsync(100); // timeout lands before the drain grace ends
-    expect(result).toMatchObject({ code: 0, timedOut: true });
+    await vi.advanceTimersByTimeAsync(100); // execution timeout no longer applies
+    expect(result).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(900); // missing close is still bounded
+    expect(result).toMatchObject({ code: 0, timedOut: false });
     expect(child.killedWith).toEqual([]); // nothing to kill
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("still waits for close on a normal exit so stdout is fully drained", async () => {
