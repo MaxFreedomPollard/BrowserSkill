@@ -27,8 +27,8 @@ use bsk_protocol::system::{
     VersionSkewEntry,
 };
 use bsk_protocol::tools::{
-    DownloadParams, DownloadResult, HelpOutcome, RequestHelpResult, ReturnFailure,
-    TransferBeginParams, TransferIdParams, UploadParams, WaitMsParams, WaitMsResult,
+    DownloadParams, DownloadResult, ReturnFailure, TransferBeginParams, TransferIdParams,
+    UploadParams, WaitMsParams, WaitMsResult,
 };
 use bsk_protocol::{
     CancelParams, CancelResult, ErrorCode, Method, PingResult, ResponseBody, RpcError, RpcId,
@@ -44,7 +44,7 @@ use super::abort::AbortRegistry;
 use super::queue::{DEFAULT_TOOL_TIMEOUT, DispatchError};
 use super::sessions::{
     AgentWindowOptions, SessionId, StartSessionError, StopSessionError, snapshot_status_entries,
-    start_session, stop_session,
+    stop_session,
 };
 use super::state::{DAEMON_VERSION, DaemonState, PROTOCOL_VERSION};
 
@@ -202,7 +202,32 @@ pub fn full_handler(status: DaemonStatus, state: Arc<DaemonState>) -> RpcHandler
         let status = status.clone();
         let state = Arc::clone(&state);
         Box::pin(async move {
-            match method {
+            let mut params = params;
+            // Internal correlation is minted here, never accepted from a CLI caller.
+            if let Some(object) = params.as_object_mut() {
+                object.remove("_audit_id");
+            }
+            let ticket = if serde_json::to_value(&method)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.starts_with("tool.")))
+                .unwrap_or(false)
+            {
+                match state.audit.begin(params.get("session_id").and_then(Value::as_str).unwrap_or(""), &method, &params) {
+                    Ok(ticket) => ticket,
+                    Err(_) => return ResponseBody::Err(RpcError { code: ErrorCode::ProtocolError, message: "Operation audit could not be saved; action was not dispatched. Check the audit page or turn recording off.".into(), data: None }),
+                }
+            } else {
+                None
+            };
+            if let Some(ticket) = &ticket
+                && let Some(object) = params.as_object_mut()
+            {
+                object.insert(
+                    "_audit_id".into(),
+                    Value::String(ticket.operation_id.clone()),
+                );
+            }
+            let body = match method {
                 Method::SystemPing => {
                     let result = PingResult { pong: true };
                     ResponseBody::Ok(serde_json::to_value(result).unwrap_or(Value::Null))
@@ -211,10 +236,16 @@ pub fn full_handler(status: DaemonStatus, state: Arc<DaemonState>) -> RpcHandler
                     Ok(v) => ResponseBody::Ok(v),
                     Err(e) => ResponseBody::Err(e),
                 },
-                Method::SessionStart => match handle_session_start(&state, rpc_id, params).await {
-                    Ok(v) => ResponseBody::Ok(v),
-                    Err(e) => ResponseBody::Err(e),
-                },
+                Method::SessionStartTracked => {
+                    super::session_requests::start(&state, rpc_id, params).await
+                }
+                Method::SessionRequest => super::session_requests::operate(&state, params).await,
+                Method::SessionStart => {
+                    match handle_session_start(&state, rpc_id, params, false).await {
+                        Ok(v) => ResponseBody::Ok(v),
+                        Err(e) => ResponseBody::Err(e),
+                    }
+                }
                 Method::SessionStop => match handle_session_stop(&state, rpc_id, params).await {
                     Ok(v) => ResponseBody::Ok(v),
                     Err(e) => ResponseBody::Err(e),
@@ -242,6 +273,9 @@ pub fn full_handler(status: DaemonStatus, state: Arc<DaemonState>) -> RpcHandler
                 | Method::ToolWindowResize
                 | Method::ToolEmulate
                 | Method::ToolScreenshot
+                | Method::ToolScreenshotFullPage
+                | Method::ToolScreenshotRead
+                | Method::ToolScreenshotRelease
                 | Method::ToolConsole
                 | Method::ToolNetwork
                 | Method::ToolSnapshot
@@ -253,6 +287,10 @@ pub fn full_handler(status: DaemonStatus, state: Arc<DaemonState>) -> RpcHandler
                 | Method::ToolReload
                 | Method::ToolClick
                 | Method::ToolHover
+                | Method::ToolWheel
+                | Method::ToolScrollTo
+                | Method::ToolFocus
+                | Method::ToolBlur
                 | Method::ToolFill
                 | Method::ToolPress
                 | Method::ToolSelect
@@ -273,7 +311,11 @@ pub fn full_handler(status: DaemonStatus, state: Arc<DaemonState>) -> RpcHandler
                     message: format!("method not implemented yet: {other:?}"),
                     data: None,
                 }),
+            };
+            if let Some(ticket) = ticket {
+                state.audit.finish(ticket, &body);
             }
+            body
         })
     })
 }
@@ -297,19 +339,6 @@ async fn handle_tool_dispatch(
     method: Method,
     params: Value,
 ) -> ResponseBody {
-    // `BSK_REQUEST_HELP=off` (unattended mode): never forward the
-    // blocking human-in-loop call to the extension; answer immediately
-    // with a synthetic `disabled` result.
-    if method == Method::ToolRequestHelp && crate::cli::human_loop::request_help_disabled() {
-        let result = RequestHelpResult {
-            outcome: HelpOutcome::Disabled,
-            completed_by: None,
-            note: Some(crate::cli::human_loop::REQUEST_HELP_DISABLED_NOTE.into()),
-            tab_id: params.get("tab_id").and_then(Value::as_i64).unwrap_or(0),
-            resolved_targets: None,
-        };
-        return ResponseBody::Ok(serde_json::to_value(result).unwrap_or(Value::Null));
-    }
     let session_id = match params.get("session_id").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => SessionId(s.to_string()),
         _ => {
@@ -320,6 +349,16 @@ async fn handle_tool_dispatch(
             });
         }
     };
+    // Reject before allocating local transfer resources. The extension also
+    // enforces this for third-party gateways backed by a local-mode daemon.
+    if state.config.server.is_some() && matches!(method, Method::ToolUpload | Method::ToolDownload)
+    {
+        return ResponseBody::Err(RpcError {
+            code: ErrorCode::Unsupported,
+            message: "upload and download are not supported for remote browsers".into(),
+            data: None,
+        });
+    }
     // Pre-flight: if the user has clicked the agent-window mask's
     // stop button, every session carries a one-shot "pending
     // interrupt" marker. The marker is consumed by the next method
@@ -350,7 +389,40 @@ async fn handle_tool_dispatch(
             });
         }
     };
+    let audit_id = params.get("_audit_id").cloned();
     let mut params = params;
+    if method == Method::ToolTabBorrow {
+        // Old CLI clients can still send this field. Never forward their
+        // override to an older extension that would act on it.
+        if let Some(confirm) = params.get("confirm")
+            && !confirm.is_boolean()
+            && !confirm.is_null()
+        {
+            return ResponseBody::Err(invalid_params("confirm must be a boolean"));
+        }
+        if let Some(object) = params.as_object_mut() {
+            object.remove("confirm");
+        }
+        if params
+            .get("confirmation_timeout_ms")
+            .is_some_and(|v| !v.is_null())
+            && let Some(session) = state.sessions.get(&session_id)
+            && let Some(browser) = state.browsers.get(&session.browser_id)
+            && !bsk_protocol::tools::supports_borrow_confirmation_timeout(
+                &browser.extension_protocol_version,
+            )
+        {
+            return ResponseBody::Err(RpcError {
+                code: ErrorCode::Unsupported,
+                message: "Custom tab-borrow confirmation waits require extension protocol 1.2; update the extension or omit --timeout to use its default wait".into(),
+                data: Some(serde_json::json!({
+                    "reason": "unsupported_feature", "operation": "tab borrow --timeout",
+                    "component": "extension", "required_protocol": bsk_protocol::tools::BORROW_CONFIRMATION_TIMEOUT_PROTOCOL,
+                    "actual_protocol": browser.extension_protocol_version,
+                })),
+            });
+        }
+    }
     let mut download_transfer_id: Option<String> = None;
     if method == Method::ToolUpload {
         let mut upload: UploadParams = match serde_json::from_value(params) {
@@ -385,6 +457,11 @@ async fn handle_tool_dispatch(
         download.max_byte_size = Some(super::file_transfer::MAX_TRANSFER_BYTES);
         download_transfer_id = Some(staging.transfer_id);
         params = serde_json::to_value(download).unwrap_or(Value::Null);
+    }
+    if let Some(audit_id) = audit_id
+        && let Some(object) = params.as_object_mut()
+    {
+        object.insert("_audit_id".into(), audit_id);
     }
     let entry = inflight_guard.entry();
     // `record_stop` must reach the extension while `record_await` holds the
@@ -702,8 +779,28 @@ fn tool_dispatch_timeout(params: &Value) -> Result<Duration, RpcError> {
 }
 
 fn tool_dispatch_transport_timeout(method: &Method, params: &Value) -> Result<Duration, RpcError> {
-    tool_dispatch_timeout(params).map(|timeout| {
-        if matches!(method, Method::ToolUpload | Method::ToolDownload) {
+    if *method == Method::ToolTabBorrow {
+        let ms = params
+            .get("confirmation_timeout_ms")
+            .map_or(Some(60_000), Value::as_u64)
+            .filter(|ms| (1..=2_147_000_000).contains(ms))
+            .ok_or_else(|| {
+                invalid_params("confirmation_timeout_ms must be a positive bounded integer")
+            })?;
+        // Include the UI countdown/fade and Chrome move before deadline cancellation.
+        return Ok(Duration::from_millis(ms).saturating_add(Duration::from_secs(15)));
+    }
+    let timeout = if *method == Method::ToolScreenshotFullPage && params.get("timeout_ms").is_none()
+    {
+        Ok(Duration::from_secs(120))
+    } else {
+        tool_dispatch_timeout(params)
+    };
+    timeout.map(|timeout| {
+        if matches!(
+            method,
+            Method::ToolUpload | Method::ToolDownload | Method::ToolRequestHelp
+        ) {
             timeout.saturating_add(EXTENSION_RESPONSE_GRACE)
         } else {
             timeout
@@ -730,6 +827,8 @@ struct CliSessionStartParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CliSessionStartResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<bsk_protocol::tools::InteractionPolicy>,
     pub session_id: String,
     pub browser_instance_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -813,11 +912,16 @@ fn clamp_browser_wait(wait_ms: Option<u64>) -> Option<Duration> {
     ))
 }
 
-async fn handle_session_start(
+pub(super) async fn handle_session_start(
     state: &Arc<DaemonState>,
     rpc_id: RpcId,
     params: Value,
+    recoverable: bool,
 ) -> Result<Value, RpcError> {
+    let task_name = params
+        .get("task_name")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let abort_guard = state
         .abort_registry
         .register(rpc_id)
@@ -854,7 +958,7 @@ async fn handle_session_start(
             });
         }
     };
-    match start_session(
+    match super::sessions::start_session_recoverable(
         &state.browsers,
         &state.sessions,
         &state.tool_queues,
@@ -866,18 +970,28 @@ async fn handle_session_start(
         state.config.extension_connect_wait,
         DEFAULT_RPC_TIMEOUT,
         Some(cancel),
+        recoverable,
     )
     .await
     {
         Ok(session) => {
+            if let Some(name) = task_name {
+                state.audit.set_name(&session.id.0, &name);
+            }
             let result = CliSessionStartResult {
+                interaction: session.interaction,
                 session_id: session.id.0.clone(),
                 browser_instance_id: session.browser_id.0.clone(),
                 agent_window_id: session.agent_window_id,
             };
             Ok(serde_json::to_value(result).unwrap_or(Value::Null))
         }
-        Err(err) => Err(map_start_error(err)),
+        Err(err) => {
+            if recoverable && let StartSessionError::CleanupFailed { session_id, .. } = &err {
+                state.tool_queues.spawn(session_id.clone());
+            }
+            Err(map_start_error(err))
+        }
     }
 }
 
@@ -1399,6 +1513,28 @@ mod windows {
                 connected = pipe.connect() => {
                     match connected {
                         Ok(()) => {
+                            // Keep the connected instance alive until its replacement
+                            // exists. Otherwise a fast handler can close the last
+                            // instance and make new clients fail with NotFound.
+                            loop {
+                                match ServerOptions::new()
+                                    .access_inbound(true)
+                                    .access_outbound(true)
+                                    .create(&listener.pipe_name)
+                                {
+                                    Ok(next) => {
+                                        listener.first = Some(next);
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        warn!(?err, "create next named-pipe instance failed");
+                                        tokio::select! {
+                                            _ = &mut shutdown => return,
+                                            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                                        }
+                                    }
+                                }
+                            }
                             on_open();
                             let handler = handler.clone();
                             let on_act = on_activity.clone();
@@ -1467,6 +1603,118 @@ mod windows {
         }
         Ok(())
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::net::windows::named_pipe::ClientOptions;
+        use tokio::sync::oneshot;
+
+        fn isolated_listener() -> NamedPipeListener {
+            let pipe_name = format!(r"\\.\pipe\bsk-test-{}", uuid::Uuid::new_v4());
+            let first = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)
+                .unwrap();
+            NamedPipeListener {
+                pipe_name,
+                first: Some(first),
+            }
+        }
+
+        #[tokio::test]
+        async fn next_instance_exists_before_connection_is_handed_off() {
+            let listener = isolated_listener();
+            let name = listener.pipe_name.clone();
+            let probe_name = name.clone();
+            let (probe_tx, probe_rx) = oneshot::channel();
+            let probe_tx = Mutex::new(Some(probe_tx));
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let server = tokio::spawn(serve(
+                listener,
+                crate::daemon::ipc::default_ping_handler(),
+                move || {
+                    if let Some(tx) = probe_tx.lock().unwrap().take() {
+                        // This callback runs before the connection task can finish.
+                        // A second client must already have an instance to open.
+                        let result = ClientOptions::new().open(&probe_name).map(drop);
+                        let _ = tx.send(result);
+                    }
+                },
+                || {},
+                || {},
+                async {
+                    let _ = stop_rx.await;
+                },
+            ));
+            let client = ClientOptions::new().open(&name).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), probe_rx).await;
+            drop(client);
+            let _ = stop_tx.send(());
+            server.await.unwrap();
+            result
+                .expect("accept callback ran")
+                .unwrap()
+                .expect("next pipe instance is ready");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn rapid_disconnects_and_concurrent_rpc_connections() {
+            let listener = isolated_listener();
+            let name = listener.pipe_name.clone();
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let server = tokio::spawn(serve(
+                listener,
+                crate::daemon::ipc::default_ping_handler(),
+                || {},
+                || {},
+                || {},
+                async {
+                    let _ = stop_rx.await;
+                },
+            ));
+            let exercise = async {
+                // Include clients that close without sending any request.
+                for _ in 0..64 {
+                    drop(
+                        crate::ipc_client::Client::connect_path(name.clone().into())
+                            .await
+                            .unwrap(),
+                    );
+                }
+                let mut clients = tokio::task::JoinSet::new();
+                for _ in 0..8 {
+                    let name = name.clone();
+                    clients.spawn(async move {
+                        for _ in 0..32 {
+                            let mut client =
+                                crate::ipc_client::Client::connect_path(name.clone().into())
+                                    .await
+                                    .unwrap();
+                            let reply: bsk_protocol::PingResult = client
+                                .call(
+                                    bsk_protocol::Method::SystemPing,
+                                    &serde_json::json!({}),
+                                    Duration::from_secs(5),
+                                )
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            assert!(reply.pong);
+                        }
+                    });
+                }
+                while let Some(result) = clients.join_next().await {
+                    result.unwrap();
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(30), exercise).await;
+            let _ = stop_tx.send(());
+            server.await.unwrap();
+            result.expect("connection exercise completed");
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1479,6 +1727,38 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
+
+    #[test]
+    fn borrow_wait_budget_covers_the_confirmation_and_browser_move() {
+        let ordinary =
+            tool_dispatch_transport_timeout(&Method::ToolTabBorrow, &serde_json::json!({}))
+                .unwrap();
+        assert_eq!(ordinary, Duration::from_secs(75));
+        let custom = tool_dispatch_transport_timeout(
+            &Method::ToolTabBorrow,
+            &serde_json::json!({"confirmation_timeout_ms": 120_000}),
+        )
+        .unwrap();
+        assert_eq!(custom, Duration::from_secs(135));
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("60s"),
+            serde_json::json!(2_147_000_001_u64),
+        ] {
+            assert!(
+                tool_dispatch_transport_timeout(
+                    &Method::ToolTabBorrow,
+                    &serde_json::json!({"confirmation_timeout_ms": invalid})
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            tool_dispatch_transport_timeout(&Method::ToolClick, &serde_json::json!({})).unwrap(),
+            DEFAULT_TOOL_TIMEOUT
+        );
+    }
 
     #[test]
     fn session_stop_timeout_covers_stop_round_trip() {
@@ -1510,15 +1790,53 @@ mod tests {
     }
 
     #[test]
+    fn full_page_screenshot_uses_its_capture_deadline() {
+        assert_eq!(
+            tool_dispatch_transport_timeout(
+                &Method::ToolScreenshotFullPage,
+                &serde_json::json!({})
+            )
+            .unwrap(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            tool_dispatch_transport_timeout(
+                &Method::ToolScreenshotFullPage,
+                &serde_json::json!({"timeout_ms": 300_000}),
+            )
+            .unwrap(),
+            Duration::from_secs(300)
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(null),
+            serde_json::json!("120s"),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            let err = tool_dispatch_transport_timeout(
+                &Method::ToolScreenshotFullPage,
+                &serde_json::json!({"timeout_ms": invalid}),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidParams);
+        }
+    }
+
+    #[test]
     fn extension_transport_outlives_the_operation_deadline() {
         let params = serde_json::json!({
             "session_id": "abcd",
             "timeout_ms": 60_000,
         });
-        let dispatch_timeout =
-            tool_dispatch_transport_timeout(&Method::ToolUpload, &params).unwrap();
-
-        assert_eq!(dispatch_timeout, Duration::from_secs(62));
+        for method in [
+            Method::ToolUpload,
+            Method::ToolDownload,
+            Method::ToolRequestHelp,
+        ] {
+            let dispatch_timeout = tool_dispatch_transport_timeout(&method, &params).unwrap();
+            assert_eq!(dispatch_timeout, Duration::from_secs(62));
+        }
     }
 
     #[test]

@@ -1,12 +1,12 @@
 /**
  * Shared view logic for the observation carriers (the floating overlay card
- * and the better-sidebar tab): the store-backed view model (snapshot, focus
+ * and the native sidebar tab): the store-backed view model (snapshot, focus
  * pinning, elapsed ticker) and the Document PiP pop-out. Extracted from
  * ObservationOverlay so both carriers run the same focus/interrupt behavior
  * without duplicating hooks.
  */
 
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { SessionObservation } from "../observation";
 import type { ObservationClientStore, OverlaySnapshot } from "./observation-store";
 
@@ -68,7 +68,7 @@ export function visibleToScope(obs: SessionObservation, scopeId: string): boolea
  * The store-backed observation view model. Holds the feed for the component
  * lifetime (refcounted — overlapping carriers never kill each other's
  * stream). `scopeId` narrows the view to one DSH conversation's sessions
- * (the better-sidebar tab); undefined keeps the global view (floating
+ * (the native sidebar tab); undefined keeps the global view (floating
  * card, PiP).
  */
 export function useObservationView(
@@ -112,6 +112,49 @@ export function useObservationView(
     onTogglePin,
     now,
   };
+}
+
+/** A mounted metadata watcher is not necessarily a visible screenshot viewer. */
+export function useThumbnailObservation(store: ObservationClientStore, enabled: boolean) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const element = ref.current;
+    if (!enabled || element === null) return;
+    // A portal uses its PiP document's visibility, independently of the main tab.
+    const doc = element.ownerDocument;
+    const Observer = doc.defaultView?.IntersectionObserver;
+    let active = true;
+    let intersecting = Observer === undefined;
+    let release: (() => void) | undefined;
+    const update = () => {
+      if (!active) return;
+      const visible = intersecting && doc.visibilityState !== "hidden";
+      if (visible && release === undefined) release = store.watchThumbnails();
+      else if (!visible && release !== undefined) {
+        release();
+        release = undefined;
+      }
+    };
+    const observer =
+      Observer === undefined
+        ? undefined
+        : new Observer((entries) => {
+            intersecting = entries.some(
+              (entry) => entry.target === element && entry.isIntersecting,
+            );
+            update();
+          });
+    observer?.observe(element);
+    doc.addEventListener("visibilitychange", update);
+    update();
+    return () => {
+      active = false;
+      observer?.disconnect();
+      doc.removeEventListener("visibilitychange", update);
+      release?.();
+    };
+  }, [store, enabled]);
+  return ref;
 }
 
 export interface PipHandle {
