@@ -87,7 +87,7 @@ const SETTLE_AFTER_KILL_SLACK_MS = 1000;
 // something else is holding the pipes. Bytes arriving inside the window can
 // still be the child's own buffered output, so every chunk restarts the window
 // and EXIT_DRAIN_MAX_MS caps the total wait.
-const EXIT_DRAIN_GRACE_MS = 250;
+const EXIT_DRAIN_GRACE_MS = 1000;
 const EXIT_DRAIN_MAX_MS = 2000;
 const SESSION_BUSY_RETRY_DELAY_MS = 100;
 
@@ -100,7 +100,7 @@ interface LiveRun {
 export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): BskRunner {
   const live = new Map<ChildProcess, LiveRun>();
   const windows = process.platform === "win32";
-  const cancelling = new Set<ChildProcess>();
+  const cancelling = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
   const killGraceMs = windows ? WINDOWS_KILL_GRACE_MS : KILL_GRACE_MS;
   // The kill grace and the settlement deadline stay in step: a Windows
   // cancellation using its full 15s must not be cut short by a 4s fallback.
@@ -108,19 +108,15 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
 
   function killChild(child: ChildProcess): void {
     if (child.exitCode !== null || child.signalCode !== null || cancelling.has(child)) return;
-    cancelling.add(child);
-    // Node kills Windows children outright for SIGINT. EOF asks the CLI to
-    // send its existing cancel RPC and wait for browser reconciliation.
-    if (windows && child.stdin) child.stdin.end();
-    else child.kill("SIGINT");
     const force = setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }, killGraceMs);
     force.unref();
-    child.once("close", () => {
-      clearTimeout(force);
-      cancelling.delete(child);
-    });
+    cancelling.set(child, force);
+    // Node kills Windows children outright for SIGINT. EOF asks the CLI to
+    // send its existing cancel RPC and wait for browser reconciliation.
+    if (windows && child.stdin) child.stdin.end();
+    else child.kill("SIGINT");
   }
 
   return {
@@ -148,7 +144,7 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
               : undefined,
           );
           // A child exiting while cancellation closes stdin may report EPIPE.
-          // Its close/error event remains the authority for the run result.
+          // Process completion remains the authority for the run result.
           child.stdin?.on("error", () => {});
         } catch (error) {
           reject(error);
@@ -202,13 +198,12 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
           if (drainCap === undefined || settled) return;
           if (drainWindow !== undefined) clearTimeout(drainWindow);
           drainWindow = setTimeout(() => finish(drainCode), EXIT_DRAIN_GRACE_MS);
-          drainWindow.unref();
         };
         const beginDrain = (code: number | null) => {
           if (drainCap !== undefined) return;
           drainCode = code;
+          // Keep the drain referenced if exit released the last process handle.
           drainCap = setTimeout(() => finish(code), EXIT_DRAIN_MAX_MS);
-          drainCap.unref();
           extendDrain();
         };
         // Kill on our own initiative, then guarantee the promise settles even if
@@ -221,7 +216,7 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
             return;
           }
           killChild(child);
-          if (deadline === undefined) {
+          if (!settled && deadline === undefined) {
             deadline = setTimeout(() => finish(child.exitCode), settleAfterKillMs);
             deadline.unref();
           }
@@ -242,19 +237,29 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
           aborted = true;
           requestKill();
         };
-        if (options.signal?.aborted) {
-          onAbort();
-        } else {
-          options.signal?.addEventListener("abort", onAbort, { once: true });
-        }
-
         const settle = () => {
           if (timer !== undefined) clearTimeout(timer);
           if (deadline !== undefined) clearTimeout(deadline);
           if (drainWindow !== undefined) clearTimeout(drainWindow);
           if (drainCap !== undefined) clearTimeout(drainCap);
+          const force = cancelling.get(child);
+          if (force !== undefined) clearTimeout(force);
+          cancelling.delete(child);
           options.signal?.removeEventListener("abort", onAbort);
+          child.off("exit", onExit);
+          child.off("close", finish);
           live.delete(child);
+        };
+
+        const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+          if (signal !== null || timedOut || aborted) {
+            // Killed on our initiative: nothing left worth draining.
+            finish(code);
+            return;
+          }
+          // Normal exit: keep draining while bytes are still arriving, then
+          // settle even if a grandchild is still holding the pipes open.
+          beginDrain(code);
         };
 
         child.on("error", (error) => {
@@ -264,17 +269,13 @@ export function createBskRunner(bskPath: string, spawnImpl: SpawnImpl = spawn): 
           release();
           reject(error);
         });
-        child.on("close", (code) => finish(code));
-        child.on("exit", (code, signal) => {
-          if (signal !== null || timedOut || aborted) {
-            // Killed on our initiative: nothing left worth draining.
-            finish(code);
-            return;
-          }
-          // Normal exit: keep draining while bytes are still arriving, then
-          // settle even if a grandchild is still holding the pipes open.
-          beginDrain(code);
-        });
+        child.on("close", finish);
+        child.once("exit", onExit);
+        if (options.signal?.aborted) {
+          onAbort();
+        } else {
+          options.signal?.addEventListener("abort", onAbort, { once: true });
+        }
       });
     },
     killAll() {

@@ -188,7 +188,7 @@ describe("createBskRunner", () => {
     child.emit("exit", 0, null); // process gone; pipes still held open
     await vi.advanceTimersByTimeAsync(200);
     expect(result).toBeUndefined(); // still inside the drain grace
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(900);
     expect(result).toMatchObject({ code: 0, stdout: '{"session":"dfhj"}', timedOut: false });
   });
 
@@ -203,7 +203,7 @@ describe("createBskRunner", () => {
     child.stdout.emit("data", '{"session":"dfhj"}');
     child.exitCode = 0;
     child.emit("exit", 0, null); // process gone; a grandchild still holds the pipes
-    await vi.advanceTimersByTimeAsync(300);
+    await vi.advanceTimersByTimeAsync(1000);
     expect(result).toMatchObject({ code: 0 });
     expect([child.stdout.destroyed, child.stderr.destroyed]).toEqual([true, true]);
     expect(child.unrefs).toBe(1);
@@ -223,11 +223,11 @@ describe("createBskRunner", () => {
     child.exitCode = 0;
     child.emit("exit", 0, null);
     child.stdout.emit("data", '{"session":');
-    await vi.advanceTimersByTimeAsync(200);
-    child.stdout.emit("data", '"dfhj"}'); // the tail, 200ms after the head
-    await vi.advanceTimersByTimeAsync(200);
-    expect(result).toBeUndefined(); // a fixed 250ms deadline would have cut here
-    await vi.advanceTimersByTimeAsync(100); // 250ms of silence closes the window
+    await vi.advanceTimersByTimeAsync(800);
+    child.stdout.emit("data", '"dfhj"}'); // the tail, 800ms after the head
+    await vi.advanceTimersByTimeAsync(800);
+    expect(result).toBeUndefined(); // a fixed 1s deadline would have cut here
+    await vi.advanceTimersByTimeAsync(300); // 1s of silence closes the window
     expect(result).toMatchObject({ code: 0, stdout: '{"session":"dfhj"}' });
   });
 
@@ -243,7 +243,7 @@ describe("createBskRunner", () => {
     });
     child.exitCode = 0;
     child.emit("exit", 0, null);
-    // 200ms apart, so every chunk reopens the 250ms window; the last one before
+    // 200ms apart, so every chunk reopens the 1s window; the last one before
     // the 2s cap lands at 1.8s.
     for (let elapsed = 0; elapsed < 2_000; elapsed += 200) {
       child.stdout.emit("data", "x");
